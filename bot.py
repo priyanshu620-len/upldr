@@ -34,7 +34,7 @@ from pyrogram.types import (
 # ==========================================================
 API_ID = 25105426
 API_HASH = "d26c274c72a0cde1e7e157eec26f0226"
-BOT_TOKEN = "8798719912:AAGnf0sLeE_BMZb_DEyIGtROJ8xZW7A60AQ"
+BOT_TOKEN = "8643524451:AAHUGbap-7Dl0YLgB8aNPgJ1-5UvDZetoxI"
 
 app = Client("onex_video_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
