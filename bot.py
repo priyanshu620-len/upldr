@@ -34,7 +34,7 @@ from pyrogram.types import (
 # ==========================================================
 API_ID = 25105426
 API_HASH = "d26c274c72a0cde1e7e157eec26f0226"
-BOT_TOKEN = "8735915649:AAGtY9VYXFr-UJjwx39CyKqt87fZaCErAPw"
+BOT_TOKEN = "8887365742:AAGymsU7HJqRmFj0ZUqQsh3_sdkhw99quwo"
 
 app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
