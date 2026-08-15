@@ -37,6 +37,9 @@ FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# User-specific active cancellation tracker: {user_id: bool}
+STOP_REQUESTS = {}
+
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Referer': 'https://transcoded-video.b-cdn.net/'
@@ -88,7 +91,7 @@ def make_progress_bar(current, total, bar_length=15):
 
 # ==========================================================
 # PARSER & RESOLVER ENGINE
-# ==========================================================
+# ==========================================
 def parse_txt_content(content: str):
     videos = []
     lines = content.splitlines()
@@ -189,7 +192,6 @@ async def download_single_chunk(session: aiohttp.ClientSession, index: int, url:
 
 def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
     try:
-        # Standard fast copy remuxing
         cmd = [
             FFMPEG_EXE, "-y",
             "-i", ts_path,
@@ -201,7 +203,6 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
         if res.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
             return True
 
-        # Fallback with safe audio transcode
         cmd_fallback = [
             FFMPEG_EXE, "-y",
             "-i", ts_path,
@@ -216,9 +217,13 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
         return False
 
 # ==========================================================
-# ADVANCED DOWNLOAD & UPLOAD PIPELINE
+# ADVANCED DOWNLOAD & UPLOAD PIPELINE (WITH STOP SUPPORT)
 # ==========================================================
-async def process_video_download(client: Client, chat_id: int, status_msg: Message, stream_url: str, title: str):
+async def process_video_download(client: Client, chat_id: int, user_id: int, status_msg: Message, stream_url: str, title: str) -> bool:
+    if STOP_REQUESTS.get(user_id, False):
+        await status_msg.edit_text("🛑 **Process was cancelled by user.**")
+        return False
+
     clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip() or "video"
     output_mp4 = os.path.join(DOWNLOAD_DIR, f"{clean_title}_{int(time.time())}.mp4")
     temp_ts = output_mp4.replace(".mp4", ".ts")
@@ -230,7 +235,7 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
 
         if "error" in video_info or not video_info.get("segments"):
             await status_msg.edit_text(f"❌ **Failed to fetch stream:** {video_info.get('error', 'No segments found')}")
-            return
+            return False
 
         segments = video_info["segments"]
         total_segs = len(segments)
@@ -244,6 +249,12 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
         tasks = [asyncio.create_task(download_single_chunk(session, idx, url, sem)) for idx, url in enumerate(segments)]
 
         for future in asyncio.as_completed(tasks):
+            if STOP_REQUESTS.get(user_id, False):
+                for t in tasks:
+                    t.cancel()
+                await status_msg.edit_text("🛑 **Download cancelled by user.**")
+                return False
+
             idx, content = await future
             if content:
                 downloaded_chunks[idx] = content
@@ -266,11 +277,16 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
                         f"📊 **Segments:** `{completed_segs}` / `{total_segs}`\n"
                         f"💾 **Size:** `{format_bytes(downloaded_bytes)}` / `~{format_bytes(est_total_size)}`\n"
                         f"⚡ **Speed:** `{format_bytes(speed)}/s`\n"
-                        f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`"
+                        f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`\n\n"
+                        f"🛑 *Send /stop to cancel the task.*"
                     )
                 except Exception:
                     pass
                 last_update = time.time()
+
+        if STOP_REQUESTS.get(user_id, False):
+            await status_msg.edit_text("🛑 **Process stopped by user.**")
+            return False
 
         await status_msg.edit_text("⚙️ **Merging & Remuxing stream to MP4...**")
         with open(temp_ts, "wb") as f:
@@ -293,7 +309,7 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
 
         if not os.path.exists(output_mp4) or os.path.getsize(output_mp4) == 0:
             await status_msg.edit_text("❌ **Download & Remuxing failed!**")
-            return
+            return False
 
         file_size = os.path.getsize(output_mp4)
         upload_start = time.time()
@@ -331,22 +347,33 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
         if os.path.exists(output_mp4):
             os.remove(output_mp4)
         await status_msg.delete()
+        return True
 
-# ==========================================
+# ==========================================================
 # BOT HANDLERS
-# ==========================================
+# ==========================================================
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
+    STOP_REQUESTS[message.from_user.id] = False
     await message.reply_text(
         "👋 **Video & Stream Downloader Bot Active!**\n\n"
         "• Send any `.m3u8` / video link directly to download.\n"
-        "• Send or forward a `.txt` batch playlist file to download all lectures."
+        "• Send a `.txt` batch playlist file to download all lectures.\n"
+        "• Send **/stop** anytime to cancel active downloading tasks."
     )
+
+@app.on_message(filters.command("stop"))
+async def stop_handler(client: Client, message: Message):
+    STOP_REQUESTS[message.from_user.id] = True
+    await message.reply_text("🛑 **Stopping and clearing all active tasks...**")
 
 @app.on_message(filters.document)
 async def doc_handler(client: Client, message: Message):
     if not message.document.file_name.endswith(".txt"):
         return
+
+    user_id = message.from_user.id
+    STOP_REQUESTS[user_id] = False
 
     status = await message.reply_text("📄 **Parsing .txt playlist file...**")
     file_path = await message.download()
@@ -360,21 +387,32 @@ async def doc_handler(client: Client, message: Message):
         await status.edit_text("❌ No valid video links found in this file.")
         return
 
-    await status.edit_text(f"✅ Found **{len(videos)}** videos! Starting batch process...")
+    await status.edit_text(f"✅ Found **{len(videos)}** videos! Starting batch process...\n*(Send /stop anytime to abort)*")
+    
     for idx, v in enumerate(videos, 1):
+        if STOP_REQUESTS.get(user_id, False):
+            await message.reply_text("⏹️ **Batch process stopped completely.**")
+            break
+
         task_status = await message.reply_text(f"🚀 Processing `{idx}/{len(videos)}`: **{v['title']}**")
-        await process_video_download(client, message.chat.id, task_status, v["url"], v["title"])
+        success = await process_video_download(client, message.chat.id, user_id, task_status, v["url"], v["title"])
+        if not success and STOP_REQUESTS.get(user_id, False):
+            await message.reply_text("⏹️ **Batch queue cancelled.**")
+            break
 
 @app.on_message(filters.text & filters.regex(r"https?://[^\s]+"))
 async def url_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    STOP_REQUESTS[user_id] = False
+    
     url = message.text.strip()
     status_msg = await message.reply_text("⚡ **Initializing task...**")
     title = f"Video_{int(time.time())}"
-    await process_video_download(client, message.chat.id, status_msg, url, title)
+    await process_video_download(client, message.chat.id, user_id, status_msg, url, title)
 
-# ==========================================
+# ==========================================================
 # APP ENTRY POINT
-# ==========================================
+# ==========================================================
 if __name__ == "__main__":
     threading.Thread(target=run_web_server, daemon=True).start()
     print("🚀 Bot starting with Pyrogram engine...")
