@@ -60,7 +60,7 @@ def run_web_server():
     server.serve_forever()
 
 # ==========================================================
-# UTILITY FUNCTIONS
+# UTILITY & FORMATTER FUNCTIONS
 # ==========================================================
 def format_bytes(size_bytes):
     if size_bytes <= 0:
@@ -70,6 +70,14 @@ def format_bytes(size_bytes):
     p = math.pow(1024, i)
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
+
+def time_formatter(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 def make_progress_bar(current, total, bar_length=15):
     if total <= 0:
@@ -181,7 +189,7 @@ async def download_single_chunk(session: aiohttp.ClientSession, index: int, url:
 
 def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
     try:
-        # Attempt 1: Standard Fast Remux without problematic audio bitstream filter
+        # Standard fast copy remuxing
         cmd = [
             FFMPEG_EXE, "-y",
             "-i", ts_path,
@@ -193,7 +201,7 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
         if res.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
             return True
 
-        # Attempt 2: Fallback with audio transcode if stream audio layout fails copy
+        # Fallback with safe audio transcode
         cmd_fallback = [
             FFMPEG_EXE, "-y",
             "-i", ts_path,
@@ -208,7 +216,7 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
         return False
 
 # ==========================================================
-# DOWNLOAD & UPLOAD PIPELINE
+# ADVANCED DOWNLOAD & UPLOAD PIPELINE
 # ==========================================================
 async def process_video_download(client: Client, chat_id: int, status_msg: Message, stream_url: str, title: str):
     clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip() or "video"
@@ -221,13 +229,14 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
         video_info = await get_video_info_async(session, resolved_url)
 
         if "error" in video_info or not video_info.get("segments"):
-            await status_msg.edit_text(f"❌ **Failed to fetch manifest:** {video_info.get('error', 'No segments found')}")
+            await status_msg.edit_text(f"❌ **Failed to fetch stream:** {video_info.get('error', 'No segments found')}")
             return
 
         segments = video_info["segments"]
         total_segs = len(segments)
         sem = asyncio.Semaphore(35)
         downloaded_chunks = {}
+        downloaded_bytes = 0
         completed_segs = 0
         last_update = time.time()
         start_time = time.time()
@@ -238,19 +247,26 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
             idx, content = await future
             if content:
                 downloaded_chunks[idx] = content
+                downloaded_bytes += len(content)
             completed_segs += 1
 
-            if time.time() - last_update > 4 or completed_segs == total_segs:
+            if time.time() - last_update > 3.5 or completed_segs == total_segs:
                 pct = (completed_segs / total_segs) * 100
                 bar = make_progress_bar(completed_segs, total_segs)
                 elapsed = max(time.time() - start_time, 0.1)
+                speed = downloaded_bytes / elapsed
                 eta = (total_segs - completed_segs) / (completed_segs / elapsed) if completed_segs > 0 else 0
+                est_total_size = (downloaded_bytes / max(completed_segs, 1)) * total_segs
+
                 try:
                     await status_msg.edit_text(
-                        f"📥 **Downloading:** `{title}`\n\n"
-                        f"[{bar}] `{pct:.1f}%`\n"
-                        f"📊 **Segments:** `{completed_segs}/{total_segs}`\n"
-                        f"⏱️ **ETA:** `{int(eta)}s`"
+                        f"📥 **DOWNLOADING LECTURE**\n"
+                        f"🎬 **Title:** `{title}`\n\n"
+                        f"`[{bar}]` **{pct:.1f}%**\n\n"
+                        f"📊 **Segments:** `{completed_segs}` / `{total_segs}`\n"
+                        f"💾 **Size:** `{format_bytes(downloaded_bytes)}` / `~{format_bytes(est_total_size)}`\n"
+                        f"⚡ **Speed:** `{format_bytes(speed)}/s`\n"
+                        f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`"
                     )
                 except Exception:
                     pass
@@ -266,7 +282,6 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
 
         remux_status = await asyncio.to_thread(remux_ts_to_mp4, temp_ts, output_mp4)
 
-        # Fallback: Agar remux fail ho toh direct TS file ko MP4 rename karke serve karein
         if not remux_status or not os.path.exists(output_mp4) or os.path.getsize(output_mp4) == 0:
             if os.path.exists(temp_ts):
                 if os.path.exists(output_mp4):
@@ -281,18 +296,26 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
             return
 
         file_size = os.path.getsize(output_mp4)
-        await status_msg.edit_text(f"📤 **Uploading to Telegram...**\n💾 Size: `{format_bytes(file_size)}`")
+        upload_start = time.time()
+        last_update = 0
 
         async def upload_progress(current, total):
             nonlocal last_update
-            if time.time() - last_update > 4:
+            if time.time() - last_update > 3.5 or current == total:
                 pct = (current / total) * 100
                 bar = make_progress_bar(current, total)
+                elapsed = max(time.time() - upload_start, 0.1)
+                speed = current / elapsed
+                eta = (total - current) / speed if speed > 0 else 0
+
                 try:
                     await status_msg.edit_text(
-                        f"📤 **Uploading:** `{title}`\n\n"
-                        f"[{bar}] `{pct:.1f}%`\n"
-                        f"💾 `{format_bytes(current)}` / `{format_bytes(total)}`"
+                        f"📤 **UPLOADING TO TELEGRAM**\n"
+                        f"🎬 **Title:** `{title}`\n\n"
+                        f"`[{bar}]` **{pct:.1f}%**\n\n"
+                        f"💾 **Size:** `{format_bytes(current)}` / `{format_bytes(total)}`\n"
+                        f"⚡ **Speed:** `{format_bytes(speed)}/s`\n"
+                        f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`"
                     )
                 except Exception:
                     pass
@@ -316,8 +339,8 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
         "👋 **Video & Stream Downloader Bot Active!**\n\n"
-        "• Send any `.m3u8` link directly to download.\n"
-        "• Upload a `.txt` batch playlist file to download lectures."
+        "• Send any `.m3u8` / video link directly to download.\n"
+        "• Send or forward a `.txt` batch playlist file to download all lectures."
     )
 
 @app.on_message(filters.document)
@@ -325,7 +348,7 @@ async def doc_handler(client: Client, message: Message):
     if not message.document.file_name.endswith(".txt"):
         return
 
-    status = await message.reply_text("📄 **Parsing .txt file...**")
+    status = await message.reply_text("📄 **Parsing .txt playlist file...**")
     file_path = await message.download()
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -334,10 +357,10 @@ async def doc_handler(client: Client, message: Message):
 
     videos = parse_txt_content(content)
     if not videos:
-        await status.edit_text("❌ No valid video URLs found in this file.")
+        await status.edit_text("❌ No valid video links found in this file.")
         return
 
-    await status.edit_text(f"✅ Found **{len(videos)}** videos! Starting batch download...")
+    await status.edit_text(f"✅ Found **{len(videos)}** videos! Starting batch process...")
     for idx, v in enumerate(videos, 1):
         task_status = await message.reply_text(f"🚀 Processing `{idx}/{len(videos)}`: **{v['title']}**")
         await process_video_download(client, message.chat.id, task_status, v["url"], v["title"])
@@ -345,7 +368,7 @@ async def doc_handler(client: Client, message: Message):
 @app.on_message(filters.text & filters.regex(r"https?://[^\s]+"))
 async def url_handler(client: Client, message: Message):
     url = message.text.strip()
-    status_msg = await message.reply_text("⚡ **Initializing download task...**")
+    status_msg = await message.reply_text("⚡ **Initializing task...**")
     title = f"Video_{int(time.time())}"
     await process_video_download(client, message.chat.id, status_msg, url, title)
 
