@@ -22,23 +22,33 @@ except RuntimeError:
 import aiohttp
 import imageio_ffmpeg
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import (
+    Message, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    CallbackQuery
+)
 
 # ==========================================================
 # BOT CREDENTIALS & CONFIGURATION
 # ==========================================================
 API_ID = 25105426
 API_HASH = "d26c274c72a0cde1e7e157eec26f0226"
-BOT_TOKEN = "8735915649:AAGtY9VYXFr-UJjwx39CyKqt87fZaCErAPw"
+BOT_TOKEN = "8798719912:AAGnf0sLeE_BMZb_DEyIGtROJ8xZW7A60AQ"
 
 app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = "downloads"
+THUMB_DIR = "thumbnails"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(THUMB_DIR, exist_ok=True)
 
-# User-specific active cancellation tracker: {user_id: bool}
+# State Management
 STOP_REQUESTS = {}
+USER_PENDING_BATCH = {}
+USER_PENDING_URL = {}
+USER_QUALITY_PREF = {}
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -52,7 +62,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is active and running!")
+        self.wfile.write(b"ONeX Extractor Bot is running!")
 
     def log_message(self, format, *args):
         pass
@@ -63,7 +73,7 @@ def run_web_server():
     server.serve_forever()
 
 # ==========================================================
-# UTILITY & FORMATTER FUNCTIONS
+# UTILITIES & FORMATTERS
 # ==========================================================
 def format_bytes(size_bytes):
     if size_bytes <= 0:
@@ -89,9 +99,13 @@ def make_progress_bar(current, total, bar_length=15):
     filled = int(fraction * bar_length)
     return "█" * filled + "░" * (bar_length - filled)
 
+def get_thumbnail_path(user_id: int):
+    path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
+    return path if os.path.exists(path) else None
+
 # ==========================================================
-# PARSER & RESOLVER ENGINE
-# ==========================================
+# UNIVERSAL TXT PARSER ENGINE
+# ==========================================================
 def parse_txt_content(content: str):
     videos = []
     lines = content.splitlines()
@@ -125,21 +139,31 @@ def parse_txt_content(content: str):
                 video_tag_idx = i
                 break
 
+        batch_name = prefix_parts[0] if len(prefix_parts) > 0 else "General Batch"
+        topic_name = prefix_parts[1] if len(prefix_parts) > 1 else "Live Lecture"
+
         if video_tag_idx != -1:
             title_parts = prefix_parts[video_tag_idx + 1:]
             title = ' - '.join(title_parts) if title_parts else f'Lecture_{len(videos)+1}'
+            if video_tag_idx > 1:
+                topic_name = " → ".join(prefix_parts[1:video_tag_idx])
         else:
-            title = ' - '.join(prefix_parts[1:]) if len(prefix_parts) > 1 else prefix_parts[0]
+            title = ' - '.join(prefix_parts[2:]) if len(prefix_parts) > 2 else (prefix_parts[1] if len(prefix_parts) > 1 else prefix_parts[0])
 
         videos.append({
             'index': len(videos) + 1,
             'title': title,
+            'topic': topic_name,
+            'batch': batch_name,
             'url': url,
             'line': line_idx
         })
 
     return videos
 
+# ==========================================================
+# STREAM & QUALITY RESOLVER
+# ==========================================================
 async def resolve_quality_url(session: aiohttp.ClientSession, original_url: str, desired_quality: str = "720p") -> str:
     if not original_url.startswith("http") or desired_quality in ["best", "original"]:
         return original_url
@@ -154,6 +178,22 @@ async def resolve_quality_url(session: aiohttp.ClientSession, original_url: str,
             except Exception:
                 pass
             break
+
+    master_url = re.sub(r"/(1080p|720p|480p|360p)/playlist\.m3u8", "/master.m3u8", original_url)
+    try:
+        async with session.get(master_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            if r.status == 200:
+                text = await r.text()
+                lines = text.splitlines()
+                for i, line in enumerate(lines):
+                    if "RESOLUTION=" in line and desired_quality.replace("p", "") in line:
+                        for nxt in lines[i+1:]:
+                            nxt_s = nxt.strip()
+                            if nxt_s and not nxt_s.startswith("#"):
+                                return urllib.parse.urljoin(master_url, nxt_s)
+    except Exception:
+        pass
+
     return original_url
 
 async def get_video_info_async(session: aiohttp.ClientSession, stream_url: str):
@@ -217,20 +257,26 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
         return False
 
 # ==========================================================
-# ADVANCED DOWNLOAD & UPLOAD PIPELINE (WITH STOP SUPPORT)
+# DOWNLOAD & UPLOAD PIPELINE
 # ==========================================================
-async def process_video_download(client: Client, chat_id: int, user_id: int, status_msg: Message, stream_url: str, title: str) -> bool:
+async def process_video_download(client: Client, chat_id: int, user_id: int, status_msg: Message, video_item: dict, quality: str = "720p") -> bool:
     if STOP_REQUESTS.get(user_id, False):
         await status_msg.edit_text("🛑 **Process was cancelled by user.**")
         return False
 
+    title = video_item.get("title", "Lecture")
+    stream_url = video_item.get("url", "")
+    index = video_item.get("index", 1)
+    topic = video_item.get("topic", "Lecture")
+    batch = video_item.get("batch", "Batch 2026")
+
     clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip() or "video"
-    output_mp4 = os.path.join(DOWNLOAD_DIR, f"{clean_title}_{int(time.time())}.mp4")
+    output_mp4 = os.path.join(DOWNLOAD_DIR, f"{index}_{clean_title}_{int(time.time())}.mp4")
     temp_ts = output_mp4.replace(".mp4", ".ts")
 
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
-        resolved_url = await resolve_quality_url(session, stream_url, "720p")
+        resolved_url = await resolve_quality_url(session, stream_url, quality)
         video_info = await get_video_info_async(session, resolved_url)
 
         if "error" in video_info or not video_info.get("segments"):
@@ -239,6 +285,7 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
 
         segments = video_info["segments"]
         total_segs = len(segments)
+        total_duration_sec = video_info.get("total_duration", 0)
         sem = asyncio.Semaphore(35)
         downloaded_chunks = {}
         downloaded_bytes = 0
@@ -252,6 +299,8 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
             if STOP_REQUESTS.get(user_id, False):
                 for t in tasks:
                     t.cancel()
+                if os.path.exists(temp_ts):
+                    os.remove(temp_ts)
                 await status_msg.edit_text("🛑 **Download cancelled by user.**")
                 return False
 
@@ -272,7 +321,8 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
                 try:
                     await status_msg.edit_text(
                         f"📥 **DOWNLOADING LECTURE**\n"
-                        f"🎬 **Title:** `{title}`\n\n"
+                        f"🎬 **Title:** `{title}`\n"
+                        f"⚙️ **Quality:** `{quality}`\n\n"
                         f"`[{bar}]` **{pct:.1f}%**\n\n"
                         f"📊 **Segments:** `{completed_segs}` / `{total_segs}`\n"
                         f"💾 **Size:** `{format_bytes(downloaded_bytes)}` / `~{format_bytes(est_total_size)}`\n"
@@ -285,6 +335,8 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
                 last_update = time.time()
 
         if STOP_REQUESTS.get(user_id, False):
+            if os.path.exists(temp_ts):
+                os.remove(temp_ts)
             await status_msg.edit_text("🛑 **Process stopped by user.**")
             return False
 
@@ -337,10 +389,25 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
                     pass
                 last_update = time.time()
 
+        # ==========================================================
+        # EXACT REQUESTED CAPTION STYLING
+        # ==========================================================
+        caption_text = (
+            f"**Index:** `{index}`\n\n"
+            f"**Title:** `{title}.mp4`\n\n"
+            f"**Topic:** `{topic}`\n\n"
+            f"**Batch:** `{batch}`\n\n"
+            f"**Extracted By:** `O ɴ ᴇ 𝐗 🍃`"
+        )
+
+        thumb = get_thumbnail_path(user_id)
+
         await client.send_video(
             chat_id=chat_id,
             video=output_mp4,
-            caption=f"🎬 **{title}**\n💾 **Size:** `{format_bytes(file_size)}`",
+            caption=caption_text,
+            thumb=thumb,
+            duration=int(total_duration_sec),
             progress=upload_progress
         )
 
@@ -350,23 +417,70 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
         return True
 
 # ==========================================================
-# BOT HANDLERS
+# INLINE KEYBOARDS
+# ==========================================================
+def get_quality_keyboard(callback_prefix: str = "qual"):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ 360p", callback_data=f"{callback_prefix}:360p"),
+            InlineKeyboardButton("⚡ 480p", callback_data=f"{callback_prefix}:480p")
+        ],
+        [
+            InlineKeyboardButton("⚡ 720p (HD)", callback_data=f"{callback_prefix}:720p"),
+            InlineKeyboardButton("⚡ 1080p (FHD)", callback_data=f"{callback_prefix}:1080p")
+        ],
+        [
+            InlineKeyboardButton("🚀 Best / Original", callback_data=f"{callback_prefix}:best")
+        ]
+    ])
+
+# ==========================================================
+# BOT MESSAGE & CALLBACK HANDLERS
 # ==========================================================
 @app.on_message(filters.command("start"))
 async def start_handler(client: Client, message: Message):
     STOP_REQUESTS[message.from_user.id] = False
     await message.reply_text(
-        "👋 **Video & Stream Downloader Bot Active!**\n\n"
-        "• Send any `.m3u8` / video link directly to download.\n"
-        "• Send a `.txt` batch playlist file to download all lectures.\n"
-        "• Send **/stop** anytime to cancel active downloading tasks."
+        "👋 **Welcome to ONeX Extractor Bot!** 🍃\n\n"
+        "⚡ **Features:**\n"
+        "• Send any `.m3u8` or stream link directly.\n"
+        "• Send `.txt` batch playlist file for course download.\n"
+        "• Send an **Image** to set custom video thumbnail.\n"
+        "• Commands: `/viewthumb`, `/delthumb`, `/stop`"
     )
 
 @app.on_message(filters.command("stop"))
 async def stop_handler(client: Client, message: Message):
     STOP_REQUESTS[message.from_user.id] = True
+    USER_PENDING_BATCH.pop(message.from_user.id, None)
+    USER_PENDING_URL.pop(message.from_user.id, None)
     await message.reply_text("🛑 **Stopping and clearing all active tasks...**")
 
+# --- Custom Thumbnail Handlers ---
+@app.on_message(filters.photo)
+async def thumb_save_handler(client: Client, message: Message):
+    thumb_path = os.path.join(THUMB_DIR, f"{message.from_user.id}.jpg")
+    await message.download(file_name=thumb_path)
+    await message.reply_text("✅ **Custom Thumbnail Saved Successfully!**")
+
+@app.on_message(filters.command("viewthumb"))
+async def view_thumb_handler(client: Client, message: Message):
+    thumb_path = get_thumbnail_path(message.from_user.id)
+    if thumb_path:
+        await message.reply_photo(photo=thumb_path, caption="🖼️ **Current Custom Thumbnail**")
+    else:
+        await message.reply_text("❌ No custom thumbnail found. Send any photo to set one.")
+
+@app.on_message(filters.command("delthumb"))
+async def del_thumb_handler(client: Client, message: Message):
+    thumb_path = get_thumbnail_path(message.from_user.id)
+    if thumb_path:
+        os.remove(thumb_path)
+        await message.reply_text("🗑️ **Custom thumbnail deleted.**")
+    else:
+        await message.reply_text("❌ No thumbnail to delete.")
+
+# --- File (.txt) Batch Handler ---
 @app.on_message(filters.document)
 async def doc_handler(client: Client, message: Message):
     if not message.document.file_name.endswith(".txt"):
@@ -380,35 +494,132 @@ async def doc_handler(client: Client, message: Message):
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
-    os.remove(file_path)
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
     videos = parse_txt_content(content)
     if not videos:
         await status.edit_text("❌ No valid video links found in this file.")
         return
 
-    await status.edit_text(f"✅ Found **{len(videos)}** videos! Starting batch process...\n*(Send /stop anytime to abort)*")
-    
-    for idx, v in enumerate(videos, 1):
-        if STOP_REQUESTS.get(user_id, False):
-            await message.reply_text("⏹️ **Batch process stopped completely.**")
-            break
+    USER_PENDING_BATCH[user_id] = {
+        'videos': videos,
+        'chat_id': message.chat.id
+    }
 
-        task_status = await message.reply_text(f"🚀 Processing `{idx}/{len(videos)}`: **{v['title']}**")
-        success = await process_video_download(client, message.chat.id, user_id, task_status, v["url"], v["title"])
-        if not success and STOP_REQUESTS.get(user_id, False):
-            await message.reply_text("⏹️ **Batch queue cancelled.**")
-            break
+    first_batch = videos[0].get('batch', 'General Course')
+    await status.edit_text(
+        f"✅ **Playlist Loaded!**\n"
+        f"📚 **Batch:** `{first_batch}`\n"
+        f"📊 **Total Videos:** `{len(videos)}`\n\n"
+        f"👉 **Select your desired video quality below:**",
+        reply_markup=get_quality_keyboard("batch_qual")
+    )
 
+# --- Direct URL Handler ---
 @app.on_message(filters.text & filters.regex(r"https?://[^\s]+"))
 async def url_handler(client: Client, message: Message):
     user_id = message.from_user.id
     STOP_REQUESTS[user_id] = False
     
     url = message.text.strip()
-    status_msg = await message.reply_text("⚡ **Initializing task...**")
-    title = f"Video_{int(time.time())}"
-    await process_video_download(client, message.chat.id, user_id, status_msg, url, title)
+    USER_PENDING_URL[user_id] = url
+
+    await message.reply_text(
+        f"🔗 **Direct URL Detected!**\n\n"
+        f"👉 **Choose Download Quality:**",
+        reply_markup=get_quality_keyboard("url_qual")
+    )
+
+# --- Callback Queries ---
+@app.on_callback_query(filters.regex(r"^url_qual:"))
+async def url_quality_callback(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    quality = query.data.split(":")[1]
+    url = USER_PENDING_URL.pop(user_id, None)
+
+    if not url:
+        await query.answer("❌ Task expired. Please send the link again.", show_alert=True)
+        return
+
+    await query.message.delete()
+    status_msg = await query.message.reply_text("⚡ **Initializing download task...**")
+    
+    video_item = {
+        'index': 1,
+        'title': f"Lecture_{int(time.time())}",
+        'topic': "Direct Extraction",
+        'batch': "Single Video Download",
+        'url': url
+    }
+    await process_video_download(client, query.message.chat.id, user_id, status_msg, video_item, quality)
+
+@app.on_callback_query(filters.regex(r"^batch_qual:"))
+async def batch_quality_callback(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    quality = query.data.split(":")[1]
+    batch_data = USER_PENDING_BATCH.get(user_id)
+
+    if not batch_data:
+        await query.answer("❌ Session expired. Re-upload the .txt file.", show_alert=True)
+        return
+
+    USER_QUALITY_PREF[user_id] = quality
+    total_count = len(batch_data['videos'])
+
+    await query.message.edit_text(
+        f"⚙️ **Quality Selected:** `{quality}`\n"
+        f"📊 **Total Videos:** `{total_count}`\n\n"
+        f"👉 **Reply with download range:**\n"
+        f"• Send `all` to download everything.\n"
+        f"• Send `1-10` to download from 1 to 10.\n"
+        f"• Send `5` to download only video #5."
+    )
+
+# --- Batch Range Reply Handler ---
+@app.on_message(filters.text & ~filters.command(["start", "stop", "viewthumb", "delthumb"]))
+async def batch_range_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in USER_PENDING_BATCH:
+        return
+
+    batch_data = USER_PENDING_BATCH.pop(user_id)
+    quality = USER_QUALITY_PREF.pop(user_id, "720p")
+    videos = batch_data['videos']
+    text = message.text.strip().lower()
+
+    if text == "all":
+        selected_videos = videos
+    elif "-" in text:
+        try:
+            start_idx, end_idx = map(int, text.split("-"))
+            selected_videos = videos[start_idx - 1:end_idx]
+        except Exception:
+            await message.reply_text("❌ Invalid range format. Please re-send .txt file.")
+            return
+    elif text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(videos):
+            selected_videos = [videos[idx - 1]]
+        else:
+            await message.reply_text("❌ Index out of range. Re-send .txt file.")
+            return
+    else:
+        await message.reply_text("❌ Invalid selection. Re-send .txt file.")
+        return
+
+    await message.reply_text(f"🚀 Queued **{len(selected_videos)}** video(s) in `{quality}`!\n*(Send /stop anytime to abort)*")
+
+    for idx, v in enumerate(selected_videos, 1):
+        if STOP_REQUESTS.get(user_id, False):
+            await message.reply_text("⏹️ **Batch process stopped completely.**")
+            break
+
+        task_status = await message.reply_text(f"🚀 Processing `{idx}/{len(selected_videos)}`: **{v['title']}**")
+        success = await process_video_download(client, message.chat.id, user_id, task_status, v, quality)
+        if not success and STOP_REQUESTS.get(user_id, False):
+            await message.reply_text("⏹️ **Batch queue cancelled.**")
+            break
 
 # ==========================================================
 # APP ENTRY POINT
