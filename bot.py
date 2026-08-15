@@ -21,7 +21,7 @@ except RuntimeError:
 
 import aiohttp
 import imageio_ffmpeg
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message, 
     InlineKeyboardMarkup, 
@@ -36,7 +36,7 @@ API_ID = 25105426
 API_HASH = "d26c274c72a0cde1e7e157eec26f0226"
 BOT_TOKEN = "8798719912:AAGnf0sLeE_BMZb_DEyIGtROJ8xZW7A60AQ"
 
-app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("onex_video_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = "downloads"
@@ -110,7 +110,6 @@ def get_video_metadata(video_path: str):
     thumb_path = video_path + "_thumb.jpg"
     width, height, duration = 1280, 720, 0
     try:
-        # Capture frame at 2 seconds to avoid intro black screen
         cmd = [
             FFMPEG_EXE, "-y",
             "-ss", "00:00:02",
@@ -121,7 +120,6 @@ def get_video_metadata(video_path: str):
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
         
-        # Probe video dimensions and duration
         cmd_probe = [FFMPEG_EXE, "-i", video_path]
         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
@@ -419,9 +417,6 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
                     pass
                 last_update = time.time()
 
-        # ==========================================
-        # EXACT CAPTION STYLING
-        # ==========================================
         caption_text = (
             f"**Index:** `{index}`\n\n"
             f"**Title:** `{title}.mp4`\n\n"
@@ -430,7 +425,6 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
             f"**Extracted By:** `O ɴ ᴇ 𝐗 🍃`"
         )
 
-        # Extract snapshot and exact dimensions to eliminate black boxes
         auto_thumb, vid_w, vid_h, vid_dur = await asyncio.to_thread(get_video_metadata, output_mp4)
         custom_thumb = get_thumbnail_path(user_id)
         final_thumb = custom_thumb if custom_thumb else auto_thumb
@@ -447,7 +441,6 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
             progress=upload_progress
         )
 
-        # Cleanup temporary files
         if auto_thumb and os.path.exists(auto_thumb):
             os.remove(auto_thumb)
         if os.path.exists(output_mp4):
@@ -682,9 +675,18 @@ async def batch_range_handler(client: Client, message: Message):
         ACTIVE_USER_TASKS.discard(user_id)
 
 # ==========================================================
-# APP ENTRY POINT
+# ASYNC ENTRY POINT
 # ==========================================================
+async def main():
+    print("🚀 Starting ONeX Extractor Pyrogram Client...")
+    await app.start()
+    print("✅ Bot is online & listening for messages!")
+    await idle()
+    await app.stop()
+
 if __name__ == "__main__":
     threading.Thread(target=run_web_server, daemon=True).start()
-    print("🚀 Bot running with anti-spam & Pyrogram engine...")
-    app.run()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
