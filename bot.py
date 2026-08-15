@@ -14,9 +14,9 @@ from pyrogram.types import Message
 # ==========================================
 # BOT CONFIGURATION
 # ==========================================
-API_ID = int(os.environ.get("API_ID", "1234567"))
-API_HASH = os.environ.get("API_HASH", "YOUR_API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
+API_ID = int(os.environ.get("API_ID", "25105426"))
+API_HASH = os.environ.get("API_HASH", "d26c274c72a0cde1e7e157eec26f0226")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8798719912:AAGnf0sLeE_BMZb_DEyIGtROJ8xZW7A60AQ")
 
 app = Client("video_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
