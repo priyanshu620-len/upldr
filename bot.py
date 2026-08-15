@@ -181,13 +181,29 @@ async def download_single_chunk(session: aiohttp.ClientSession, index: int, url:
 
 def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
     try:
+        # Attempt 1: Standard Fast Remux without problematic audio bitstream filter
         cmd = [
-            FFMPEG_EXE, "-y", "-i", ts_path,
-            "-c", "copy", "-movflags", "+faststart",
-            "-bsf:a", "aac_adtstoasc", mp4_path
+            FFMPEG_EXE, "-y",
+            "-i", ts_path,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            mp4_path
         ]
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-        return res.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0
+        if res.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
+            return True
+
+        # Attempt 2: Fallback with audio transcode if stream audio layout fails copy
+        cmd_fallback = [
+            FFMPEG_EXE, "-y",
+            "-i", ts_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            mp4_path
+        ]
+        res_fb = subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        return res_fb.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0
     except Exception:
         return False
 
@@ -240,7 +256,7 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
                     pass
                 last_update = time.time()
 
-        await status_msg.edit_text("⚙️ **Remuxing stream to MP4...**")
+        await status_msg.edit_text("⚙️ **Merging & Remuxing stream to MP4...**")
         with open(temp_ts, "wb") as f:
             for idx in range(total_segs):
                 if chunk := downloaded_chunks.get(idx):
@@ -249,11 +265,19 @@ async def process_video_download(client: Client, chat_id: int, status_msg: Messa
         gc.collect()
 
         remux_status = await asyncio.to_thread(remux_ts_to_mp4, temp_ts, output_mp4)
-        if os.path.exists(temp_ts):
-            os.remove(temp_ts)
 
-        if not remux_status or not os.path.exists(output_mp4):
-            await status_msg.edit_text("❌ **Remuxing failed!**")
+        # Fallback: Agar remux fail ho toh direct TS file ko MP4 rename karke serve karein
+        if not remux_status or not os.path.exists(output_mp4) or os.path.getsize(output_mp4) == 0:
+            if os.path.exists(temp_ts):
+                if os.path.exists(output_mp4):
+                    os.remove(output_mp4)
+                os.rename(temp_ts, output_mp4)
+        else:
+            if os.path.exists(temp_ts):
+                os.remove(temp_ts)
+
+        if not os.path.exists(output_mp4) or os.path.getsize(output_mp4) == 0:
+            await status_msg.edit_text("❌ **Download & Remuxing failed!**")
             return
 
         file_size = os.path.getsize(output_mp4)
