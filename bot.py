@@ -10,15 +10,6 @@ import threading
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ==========================================================
-# ASYNCIO EVENT LOOP FIX (Python 3.10+ Compatibility)
-# ==========================================================
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
 import aiohttp
 import imageio_ffmpeg
 from pyrogram import Client, filters, idle
@@ -58,7 +49,7 @@ HEADERS = {
 }
 
 # ==========================================================
-# DUMMY HTTP SERVER (Keeps Render Web Service Alive)
+# DUMMY HTTP SERVER (Keeps Render/Koyeb Web Services Alive)
 # ==========================================================
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -470,7 +461,7 @@ def get_quality_keyboard(callback_prefix: str = "qual"):
 # ==========================================================
 # BOT HANDLERS & ANTI-SPAM ROUTERS
 # ==========================================================
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     if message.id in PROCESSED_MESSAGES:
         return
@@ -486,7 +477,7 @@ async def start_handler(client: Client, message: Message):
         "• Commands: `/viewthumb`, `/delthumb`, `/stop`"
     )
 
-@app.on_message(filters.command("stop"))
+@app.on_message(filters.command("stop") & filters.private)
 async def stop_handler(client: Client, message: Message):
     user_id = message.from_user.id
     STOP_REQUESTS[user_id] = True
@@ -495,13 +486,13 @@ async def stop_handler(client: Client, message: Message):
     ACTIVE_USER_TASKS.discard(user_id)
     await message.reply_text("🛑 **Stopping and clearing all active tasks...**")
 
-@app.on_message(filters.photo)
+@app.on_message(filters.photo & filters.private)
 async def thumb_save_handler(client: Client, message: Message):
     thumb_path = os.path.join(THUMB_DIR, f"{message.from_user.id}.jpg")
     await message.download(file_name=thumb_path)
     await message.reply_text("✅ **Custom Thumbnail Saved Successfully!**")
 
-@app.on_message(filters.command("viewthumb"))
+@app.on_message(filters.command("viewthumb") & filters.private)
 async def view_thumb_handler(client: Client, message: Message):
     thumb_path = get_thumbnail_path(message.from_user.id)
     if thumb_path:
@@ -509,7 +500,7 @@ async def view_thumb_handler(client: Client, message: Message):
     else:
         await message.reply_text("❌ No custom thumbnail set. Send any photo to set one.")
 
-@app.on_message(filters.command("delthumb"))
+@app.on_message(filters.command("delthumb") & filters.private)
 async def del_thumb_handler(client: Client, message: Message):
     thumb_path = get_thumbnail_path(message.from_user.id)
     if thumb_path:
@@ -518,9 +509,9 @@ async def del_thumb_handler(client: Client, message: Message):
     else:
         await message.reply_text("❌ No custom thumbnail found to delete.")
 
-@app.on_message(filters.document)
+@app.on_message(filters.document & filters.private)
 async def doc_handler(client: Client, message: Message):
-    if not message.document.file_name.endswith(".txt") or message.id in PROCESSED_MESSAGES:
+    if not message.document.file_name or not message.document.file_name.endswith(".txt") or message.id in PROCESSED_MESSAGES:
         return
     PROCESSED_MESSAGES.add(message.id)
 
@@ -557,7 +548,7 @@ async def doc_handler(client: Client, message: Message):
         reply_markup=get_quality_keyboard("batch_qual")
     )
 
-@app.on_message(filters.text & filters.regex(r"https?://[^\s]+"))
+@app.on_message(filters.text & filters.regex(r"https?://[^\s]+") & filters.private)
 async def url_handler(client: Client, message: Message):
     if message.id in PROCESSED_MESSAGES:
         return
@@ -626,7 +617,7 @@ async def batch_quality_callback(client: Client, query: CallbackQuery):
         f"• Send `5` to download only video #5."
     )
 
-@app.on_message(filters.text & ~filters.command(["start", "stop", "viewthumb", "delthumb"]))
+@app.on_message(filters.text & ~filters.command(["start", "stop", "viewthumb", "delthumb"]) & filters.private)
 async def batch_range_handler(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id not in USER_PENDING_BATCH or user_id in ACTIVE_USER_TASKS:
@@ -675,18 +666,9 @@ async def batch_range_handler(client: Client, message: Message):
         ACTIVE_USER_TASKS.discard(user_id)
 
 # ==========================================================
-# ASYNC ENTRY POINT
+# MAIN EXECUTION
 # ==========================================================
-async def main():
-    print("🚀 Starting ONeX Extractor Pyrogram Client...")
-    await app.start()
-    print("✅ Bot is online & listening for messages!")
-    await idle()
-    await app.stop()
-
 if __name__ == "__main__":
     threading.Thread(target=run_web_server, daemon=True).start()
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    print("🚀 Starting ONeX Extractor Bot...")
+    app.run()
