@@ -12,7 +12,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
 import imageio_ffmpeg
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import (
     Message, 
     InlineKeyboardMarkup, 
@@ -23,11 +23,17 @@ from pyrogram.types import (
 # ==========================================================
 # BOT CREDENTIALS & CONFIGURATION
 # ==========================================================
-API_ID = 30574823
-API_HASH = "2815bb996f64421716844acaf2d51493"
-BOT_TOKEN = "8916680408:AAGNA6Y5VK68iibG5H18dr9aZj5r_mA5jEA"
+API_ID = int(os.environ.get("API_ID", 30574823))
+API_HASH = os.environ.get("API_HASH", "2815bb996f64421716844acaf2d51493")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8916680408:AAGNA6Y5VK68iibG5H18dr9aZj5r_mA5jEA")
 
-app = Client("onex_video_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "onex_video_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True
+)
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = "downloads"
@@ -94,7 +100,7 @@ def make_progress_bar(current, total, bar_length=15):
 
 def get_thumbnail_path(user_id: int):
     path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
-    return path if os.path.exists(path) else None
+    return path if os.path.exists(path) and os.path.getsize(path) > 0 else None
 
 def get_video_metadata(video_path: str):
     """Extracts width, height, duration and generates a clean snapshot thumbnail."""
@@ -124,7 +130,8 @@ def get_video_metadata(video_path: str):
     except Exception:
         pass
         
-    return thumb_path if os.path.exists(thumb_path) else None, width, height, duration
+    final_thumb = thumb_path if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0 else None
+    return final_thumb, width, height, int(duration)
 
 # ==========================================================
 # PARSER & RESOLVER ENGINE
@@ -277,7 +284,7 @@ def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
         return False
 
 # ==========================================================
-# ADVANCED PIPELINE (WITH ANTI-BLACK PREVIEW & PROGRESS)
+# ADVANCED PIPELINE (DOWNLOAD, REMUX, UPLOAD)
 # ==========================================================
 async def process_video_download(client: Client, chat_id: int, user_id: int, status_msg: Message, video_item: dict, quality: str = "720p") -> bool:
     if STOP_REQUESTS.get(user_id, False):
@@ -329,7 +336,7 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
                 downloaded_bytes += len(content)
             completed_segs += 1
 
-            if time.time() - last_update > 3.5 or completed_segs == total_segs:
+            if time.time() - last_update > 4.0 or completed_segs == total_segs:
                 pct = (completed_segs / total_segs) * 100
                 bar = make_progress_bar(completed_segs, total_segs)
                 elapsed = max(time.time() - start_time, 0.1)
@@ -382,13 +389,13 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
             await status_msg.edit_text("❌ **Download & Remuxing failed!**")
             return False
 
-        file_size = os.path.getsize(output_mp4)
+        # --- Upload Engine ---
         upload_start = time.time()
-        last_update = 0
+        last_edit_time = 0
 
         async def upload_progress(current, total):
-            nonlocal last_update
-            if time.time() - last_update > 3.5 or current == total:
+            nonlocal last_edit_time
+            if current < total and (time.time() - last_edit_time > 4.0):
                 pct = (current / total) * 100
                 bar = make_progress_bar(current, total)
                 elapsed = max(time.time() - upload_start, 0.1)
@@ -404,9 +411,9 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
                         f"⚡ **Speed:** `{format_bytes(speed)}/s`\n"
                         f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`"
                     )
+                    last_edit_time = time.time()
                 except Exception:
                     pass
-                last_update = time.time()
 
         caption_text = (
             f"**Index:** `{index}`\n\n"
@@ -420,25 +427,46 @@ async def process_video_download(client: Client, chat_id: int, user_id: int, sta
         custom_thumb = get_thumbnail_path(user_id)
         final_thumb = custom_thumb if custom_thumb else auto_thumb
 
-        await client.send_video(
-            chat_id=chat_id,
-            video=output_mp4,
-            caption=caption_text,
-            thumb=final_thumb,
-            width=vid_w,
-            height=vid_h,
-            duration=int(vid_dur) if vid_dur > 0 else None,
-            supports_streaming=True,
-            progress=upload_progress
-        )
+        if final_thumb and (not os.path.exists(final_thumb) or os.path.getsize(final_thumb) == 0):
+            final_thumb = None
+
+        uploaded_message = None
+        try:
+            uploaded_message = await client.send_video(
+                chat_id=chat_id,
+                video=output_mp4,
+                caption=caption_text,
+                thumb=final_thumb,
+                width=vid_w if vid_w else 1280,
+                height=vid_h if vid_h else 720,
+                duration=int(vid_dur) if vid_dur else 0,
+                supports_streaming=True,
+                progress=upload_progress
+            )
+        except Exception:
+            try:
+                uploaded_message = await client.send_document(
+                    chat_id=chat_id,
+                    document=output_mp4,
+                    caption=caption_text,
+                    thumb=final_thumb,
+                    progress=upload_progress
+                )
+            except Exception as e2:
+                await status_msg.edit_text(f"❌ **Upload Failed:** `{str(e2)}`")
 
         if auto_thumb and os.path.exists(auto_thumb):
             os.remove(auto_thumb)
         if os.path.exists(output_mp4):
             os.remove(output_mp4)
-            
-        await status_msg.delete()
-        return True
+
+        if uploaded_message:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            return True
+        return False
 
 # ==========================================================
 # INLINE KEYBOARDS
@@ -459,7 +487,7 @@ def get_quality_keyboard(callback_prefix: str = "qual"):
     ])
 
 # ==========================================================
-# BOT HANDLERS & ANTI-SPAM ROUTERS
+# BOT HANDLERS
 # ==========================================================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
