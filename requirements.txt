@@ -2,3 +2,8 @@ pyrofork
 tgcrypto
 aiohttp
 imageio-ffmpeg
+pyrogram
+pyromod
+aiohttp
+yt-dlp
+tgcrypto
