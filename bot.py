@@ -43,12 +43,7 @@ os.makedirs(THUMB_DIR, exist_ok=True)
 
 # State & Duplicate Locks
 STOP_REQUESTS = {}
-USER_PENDING_BATCH = {}
-USER_PENDING_URL = {}
-USER_QUALITY_PREF = {}
-ACTIVE_USER_TASKS = set()
-PROCESSED_MESSAGES = set()
-UPLOADED_URLS_REGISTRY = set()  # Tracks already uploaded URLs to prevent loops
+SWAY_SESSIONS = {}
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -72,6 +67,8 @@ def run_web_server():
     server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
+threading.Thread(target=run_web_server, daemon=True).start()
+
 # ==========================================================
 # UTILITIES & VIDEO PROBING
 # ==========================================================
@@ -83,21 +80,6 @@ def format_bytes(size_bytes):
     p = math.pow(1024, i)
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
-
-def time_formatter(seconds: float) -> str:
-    seconds = int(max(seconds, 0))
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-def make_progress_bar(current, total, bar_length=15):
-    if total <= 0:
-        return "░" * bar_length
-    fraction = min(max(current / total, 0.0), 1.0)
-    filled = int(fraction * bar_length)
-    return "█" * filled + "░" * (bar_length - filled)
 
 def get_thumbnail_path(user_id: int):
     path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
@@ -142,60 +124,53 @@ def parse_txt_content(content: str):
     lines = content.splitlines()
     url_pattern = re.compile(r'https?://[^\s|<>"\']+')
 
+    batch_name = "SelectionWay Batch"
+    current_topic = "General Topic"
+
     for line_idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
         if not line:
             continue
 
-        parts = [p.strip() for p in line.split('|')]
-        has_video_tag = any(p.upper() == 'VIDEO' for p in parts)
+        # Extract Batch Name from Header
+        if line.startswith("BATCH:"):
+            batch_name = line.replace("BATCH:", "").strip()
+            continue
+        elif "BATCH :" in line:
+            batch_name = line.split("BATCH :")[1].strip()
+            continue
+
+        # Extract Topic headers
+        if line.startswith("---") and line.endswith("---"):
+            current_topic = line.strip("- \t")
+            continue
+        elif line.startswith("TOPIC:"):
+            current_topic = line.replace("TOPIC:", "").strip()
+            continue
+
         url_match = url_pattern.search(line)
         if not url_match:
             continue
 
         url = url_match.group(0).rstrip('.,;')
-        is_m3u8 = '.m3u8' in url.lower() or 'transcoded-video' in url.lower() or '.mp4' in url.lower()
-
-        if not (has_video_tag or is_m3u8):
-            continue
-        if not is_m3u8 and any(p.upper() in ['LINK', 'IMAGE', 'DOCS', 'SLIDES', 'NOTES'] for p in parts):
-            continue
-
-        # Prevent duplicate entries in single file
         if url in seen_urls:
             continue
         seen_urls.add(url)
 
-        prefix = line[:url_match.start()].strip().rstrip('|').strip()
-        prefix_parts = [p.strip() for p in prefix.split('|') if p.strip()]
-
-        video_tag_idx = -1
-        for i, p in enumerate(prefix_parts):
-            if p.upper() == 'VIDEO':
-                video_tag_idx = i
-                break
-
-        batch_name = prefix_parts[0] if len(prefix_parts) > 0 else "General Batch"
-        topic_name = prefix_parts[1] if len(prefix_parts) > 1 else "Live Lecture"
-
-        if video_tag_idx != -1:
-            title_parts = prefix_parts[video_tag_idx + 1:]
-            title = ' - '.join(title_parts) if title_parts else f'Lecture_{len(videos)+1}'
-            if video_tag_idx > 1:
-                topic_name = " → ".join(prefix_parts[1:video_tag_idx])
-        else:
-            title = ' - '.join(prefix_parts[2:]) if len(prefix_parts) > 2 else (prefix_parts[1] if len(prefix_parts) > 1 else prefix_parts[0])
+        # Parse title
+        title_part = line[:url_match.start()].strip().rstrip(':|-').strip()
+        title = title_part if title_part else f"Lecture_{len(videos)+1}"
 
         videos.append({
             'index': len(videos) + 1,
             'title': title,
-            'topic': topic_name,
+            'topic': current_topic,
             'batch': batch_name,
             'url': url,
-            'line': line_idx
+            'is_pdf': ".pdf" in url.lower() or "pdf" in title.lower()
         })
 
-    return videos
+    return videos, batch_name
 
 async def resolve_quality_url(session: aiohttp.ClientSession, original_url: str, desired_quality: str = "720p") -> str:
     if not original_url.startswith("http") or desired_quality in ["best", "original"]:
@@ -229,251 +204,18 @@ async def resolve_quality_url(session: aiohttp.ClientSession, original_url: str,
 
     return original_url
 
-async def get_video_info_async(session: aiohttp.ClientSession, stream_url: str):
+async def download_file_direct(url: str, file_path: str) -> bool:
     try:
-        async with session.get(stream_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return {"error": f"HTTP {resp.status}"}
-            text = await resp.text()
-    except Exception as e:
-        return {"error": str(e)}
-
-    segments = []
-    total_duration = 0.0
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("#EXTINF:"):
-            try:
-                total_duration += float(line.split(":")[1].split(",")[0])
-            except Exception:
-                pass
-        elif line and not line.startswith("#"):
-            segments.append(urllib.parse.urljoin(stream_url, line))
-
-    return {"segments": segments, "total_duration": total_duration}
-
-async def download_single_chunk(session: aiohttp.ClientSession, index: int, url: str, sem: asyncio.Semaphore):
-    async with sem:
-        for _ in range(3):
-            try:
-                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                    if r.status == 200:
-                        return index, await r.read()
-            except Exception:
-                await asyncio.sleep(0.2)
-        return index, None
-
-def remux_ts_to_mp4(ts_path: str, mp4_path: str) -> bool:
-    try:
-        cmd = [
-            FFMPEG_EXE, "-y",
-            "-i", ts_path,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            mp4_path
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-        if res.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
-            return True
-
-        cmd_fallback = [
-            FFMPEG_EXE, "-y",
-            "-i", ts_path,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-movflags", "+faststart",
-            mp4_path
-        ]
-        res_fb = subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-        return res_fb.returncode == 0 and os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+                if resp.status == 200:
+                    with open(file_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 256):
+                            f.write(chunk)
+                    return os.path.exists(file_path) and os.path.getsize(file_path) > 0
     except Exception:
-        return False
-
-# ==========================================================
-# ADVANCED PIPELINE (DOWNLOAD, REMUX, UPLOAD)
-# ==========================================================
-async def process_video_download(client: Client, chat_id: int, user_id: int, status_msg: Message, video_item: dict, quality: str = "720p") -> bool:
-    if STOP_REQUESTS.get(user_id, False):
-        await status_msg.edit_text("🛑 **Process was cancelled by user.**")
-        return False
-
-    title = video_item.get("title", "Lecture")
-    stream_url = video_item.get("url", "")
-    index = video_item.get("index", 1)
-    topic = video_item.get("topic", "Lecture")
-    batch = video_item.get("batch", "Batch 2026")
-
-    clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip() or "video"
-    output_mp4 = os.path.join(DOWNLOAD_DIR, f"{user_id}_{index}_{clean_title[:30]}_{int(time.time())}.mp4")
-    temp_ts = output_mp4.replace(".mp4", ".ts")
-
-    connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        resolved_url = await resolve_quality_url(session, stream_url, quality)
-        video_info = await get_video_info_async(session, resolved_url)
-
-        if "error" in video_info or not video_info.get("segments"):
-            await status_msg.edit_text(f"❌ **Failed to fetch stream:** {video_info.get('error', 'No segments found')}")
-            return False
-
-        segments = video_info["segments"]
-        total_segs = len(segments)
-        sem = asyncio.Semaphore(35)
-        downloaded_chunks = {}
-        downloaded_bytes = 0
-        completed_segs = 0
-        last_update = time.time()
-        start_time = time.time()
-
-        tasks = [asyncio.create_task(download_single_chunk(session, idx, url, sem)) for idx, url in enumerate(segments)]
-
-        for future in asyncio.as_completed(tasks):
-            if STOP_REQUESTS.get(user_id, False):
-                for t in tasks:
-                    t.cancel()
-                if os.path.exists(temp_ts):
-                    os.remove(temp_ts)
-                await status_msg.edit_text("🛑 **Download cancelled by user.**")
-                return False
-
-            idx, content = await future
-            if content:
-                downloaded_chunks[idx] = content
-                downloaded_bytes += len(content)
-            completed_segs += 1
-
-            if time.time() - last_update > 4.0 or completed_segs == total_segs:
-                pct = (completed_segs / total_segs) * 100
-                bar = make_progress_bar(completed_segs, total_segs)
-                elapsed = max(time.time() - start_time, 0.1)
-                speed = downloaded_bytes / elapsed
-                eta = (total_segs - completed_segs) / (completed_segs / elapsed) if completed_segs > 0 else 0
-                est_total_size = (downloaded_bytes / max(completed_segs, 1)) * total_segs
-
-                try:
-                    await status_msg.edit_text(
-                        f"📥 **DOWNLOADING LECTURE**\n"
-                        f"🎬 **Title:** `{title}`\n"
-                        f"⚙️ **Quality:** `{quality}`\n\n"
-                        f"`[{bar}]` **{pct:.1f}%**\n\n"
-                        f"📊 **Segments:** `{completed_segs}` / `{total_segs}`\n"
-                        f"💾 **Size:** `{format_bytes(downloaded_bytes)}` / `~{format_bytes(est_total_size)}`\n"
-                        f"⚡ **Speed:** `{format_bytes(speed)}/s`\n"
-                        f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`\n\n"
-                        f"🛑 *Send /stop to cancel the task.*"
-                    )
-                except Exception:
-                    pass
-                last_update = time.time()
-
-        if STOP_REQUESTS.get(user_id, False):
-            if os.path.exists(temp_ts):
-                os.remove(temp_ts)
-            await status_msg.edit_text("🛑 **Process stopped by user.**")
-            return False
-
-        await status_msg.edit_text("⚙️ **Merging & Remuxing stream to MP4...**")
-        with open(temp_ts, "wb") as f:
-            for idx in range(total_segs):
-                if chunk := downloaded_chunks.get(idx):
-                    f.write(chunk)
-        downloaded_chunks.clear()
-        gc.collect()
-
-        remux_status = await asyncio.to_thread(remux_ts_to_mp4, temp_ts, output_mp4)
-
-        if not remux_status or not os.path.exists(output_mp4) or os.path.getsize(output_mp4) == 0:
-            if os.path.exists(temp_ts):
-                if os.path.exists(output_mp4):
-                    os.remove(output_mp4)
-                os.rename(temp_ts, output_mp4)
-        else:
-            if os.path.exists(temp_ts):
-                os.remove(temp_ts)
-
-        if not os.path.exists(output_mp4) or os.path.getsize(output_mp4) == 0:
-            await status_msg.edit_text("❌ **Download & Remuxing failed!**")
-            return False
-
-        # --- Upload Engine ---
-        upload_start = time.time()
-        last_edit_time = 0
-
-        async def upload_progress(current, total):
-            nonlocal last_edit_time
-            if current < total and (time.time() - last_edit_time > 4.0):
-                pct = (current / total) * 100
-                bar = make_progress_bar(current, total)
-                elapsed = max(time.time() - upload_start, 0.1)
-                speed = current / elapsed
-                eta = (total - current) / speed if speed > 0 else 0
-
-                try:
-                    await status_msg.edit_text(
-                        f"📤 **UPLOADING TO TELEGRAM**\n"
-                        f"🎬 **Title:** `{title}`\n\n"
-                        f"`[{bar}]` **{pct:.1f}%**\n\n"
-                        f"💾 **Size:** `{format_bytes(current)}` / `{format_bytes(total)}`\n"
-                        f"⚡ **Speed:** `{format_bytes(speed)}/s`\n"
-                        f"⏱️ **ETA:** `{time_formatter(eta)}` | ⏳ **Elapsed:** `{time_formatter(elapsed)}`"
-                    )
-                    last_edit_time = time.time()
-                except Exception:
-                    pass
-
-        caption_text = (
-            f"**Index:** `{index}`\n\n"
-            f"**Title:** `{title}.mp4`\n\n"
-            f"**Topic:** `{topic}`\n\n"
-            f"**Batch:** `{batch}`\n\n"
-            f"**Extracted By:** `O ɴ ᴇ 𝐗 🍃`"
-        )
-
-        auto_thumb, vid_w, vid_h, vid_dur = await asyncio.to_thread(get_video_metadata, output_mp4)
-        custom_thumb = get_thumbnail_path(user_id)
-        final_thumb = custom_thumb if custom_thumb else auto_thumb
-
-        if final_thumb and (not os.path.exists(final_thumb) or os.path.getsize(final_thumb) == 0):
-            final_thumb = None
-
-        uploaded_message = None
-        try:
-            uploaded_message = await client.send_video(
-                chat_id=chat_id,
-                video=output_mp4,
-                caption=caption_text,
-                thumb=final_thumb,
-                width=vid_w if vid_w else 1280,
-                height=vid_h if vid_h else 720,
-                duration=int(vid_dur) if vid_dur else 0,
-                supports_streaming=True,
-                progress=upload_progress
-            )
-        except Exception:
-            try:
-                uploaded_message = await client.send_document(
-                    chat_id=chat_id,
-                    document=output_mp4,
-                    caption=caption_text,
-                    thumb=final_thumb,
-                    progress=upload_progress
-                )
-            except Exception as e2:
-                await status_msg.edit_text(f"❌ **Upload Failed:** `{str(e2)}`")
-
-        if auto_thumb and os.path.exists(auto_thumb):
-            os.remove(auto_thumb)
-        if os.path.exists(output_mp4):
-            os.remove(output_mp4)
-
-        if uploaded_message:
-            UPLOADED_URLS_REGISTRY.add(stream_url)
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            return True
-        return False
+        pass
+    return False
 
 # ==========================================================
 # INLINE KEYBOARDS
@@ -498,20 +240,201 @@ def get_quality_keyboard(callback_prefix: str = "qual"):
 # ==========================================================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    if message.id in PROCESSED_MESSAGES:
-        return
-    PROCESSED_MESSAGES.add(message.id)
-    
     STOP_REQUESTS[message.from_user.id] = False
     await message.reply_text(
-        "👋 **Welcome to ONeX Extractor Bot!** 🍃\n\n"
-        "⚡ **Features:**\n"
-        "• Send any `.m3u8` or stream link directly.\n"
-        "• Send `.txt` batch playlist file for course download.\n"
-        "• Send an **Image** to set custom video thumbnail.\n"
-        "• Commands: `/viewthumb`, `/delthumb`, `/stop`"
+        "👋 **Welcome to SelectionWay Uploader Bot!** 🍃\n\n"
+        "⚡ **Commands:**\n"
+        "• `/sway` - Upload batch course from SelectionWay `.txt`\n"
+        "• `/stop` - Cancel current task"
     )
 
 @app.on_message(filters.command("stop") & filters.private)
 async def stop_handler(client: Client, message: Message):
-    user_id = message.f
+    user_id = message.from_user.id
+    STOP_REQUESTS[user_id] = True
+    await message.reply_text("🛑 **Stop request received! Ongoing downloads will terminate.**")
+
+@app.on_message(filters.command("sway") & filters.private)
+async def sway_command_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    STOP_REQUESTS[user_id] = False
+    SWAY_SESSIONS[user_id] = {"step": "WAITING_TXT"}
+
+    await client.send_message(
+        message.chat.id,
+        "📁 **Please send your SelectionWay `.txt` batch file:**"
+    )
+
+@app.on_message(filters.document & filters.private)
+async def doc_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    session = SWAY_SESSIONS.get(user_id)
+
+    if session and session.get("step") == "WAITING_TXT":
+        if not message.document.file_name.endswith(".txt"):
+            await message.reply_text("❌ Please send a valid `.txt` file.")
+            return
+
+        status = await message.reply_text("📥 **Downloading and parsing .txt file...**")
+        txt_path = await message.download()
+
+        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        items, batch_name = parse_txt_content(content)
+        if not items:
+            await status.edit_text("❌ **No video/PDF links found in this file.**")
+            os.remove(txt_path)
+            return
+
+        session["items"] = items
+        session["batch_name"] = batch_name
+        session["txt_path"] = txt_path
+        session["step"] = "WAITING_QUALITY"
+
+        await status.edit_text(
+            f"✅ **Loaded {len(items)} items from:** `{batch_name}`\n\n🎬 **Select Video Quality to Download:**",
+            reply_markup=get_quality_keyboard("swayqual")
+        )
+
+@app.on_callback_query(filters.regex(r"^swayqual:"))
+async def sway_quality_callback(client: Client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    session = SWAY_SESSIONS.get(user_id)
+
+    if not session or session.get("step") != "WAITING_QUALITY":
+        await callback.answer("Session expired. Please send /sway again.", show_alert=True)
+        return
+
+    quality = callback.data.split(":")[1]
+    session["quality"] = quality
+    session["step"] = "WAITING_CREDIT"
+
+    await callback.message.delete()
+    await client.send_message(
+        callback.message.chat.id,
+        "✍️ **Send Extracted By Name / Credit for Captions (or send `None`):**"
+    )
+    await callback.answer()
+
+@app.on_message(filters.text & filters.private)
+async def text_step_handler(client: Client, message: Message):
+    user_id = message.from_user.id
+    session = SWAY_SESSIONS.get(user_id)
+    if not session:
+        return
+
+    # Step 3: Credit text
+    if session.get("step") == "WAITING_CREDIT":
+        credit_input = message.text.strip()
+        session["credit"] = "O ɴ ᴇ 𝐗 🍃" if credit_input.lower() == "none" else credit_input
+        session["step"] = "WAITING_CHANNEL"
+
+        await message.reply_text(
+            "📢 **Send Target Channel ID to upload into (e.g., `-100xxxxxxxxxx` or `me` for Saved Messages):**"
+        )
+        return
+
+    # Step 4: Channel ID & Run Pipeline
+    if session.get("step") == "WAITING_CHANNEL":
+        channel_input = message.text.strip()
+        target_chat_id = message.chat.id if channel_input.lower() == "me" else int(channel_input)
+
+        items = session["items"]
+        quality = session["quality"]
+        credit_name = session["credit"]
+        default_batch_name = session.get("batch_name", "Batch")
+        txt_path = session["txt_path"]
+
+        SWAY_SESSIONS.pop(user_id, None)
+        status_msg = await message.reply_text(f"🚀 **Starting batch processing for {len(items)} files...**")
+
+        for idx, item in enumerate(items, 1):
+            if STOP_REQUESTS.get(user_id, False):
+                await status_msg.edit_text("🛑 **Process stopped by user.**")
+                break
+
+            title = item["title"]
+            url = item["url"]
+            topic = item.get("topic", "Live Lecture")[cite: 5]
+            batch = item.get("batch", default_batch_name)
+            is_pdf = item["is_pdf"]
+
+            clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_", "(", ")", ".")).strip() or f"file_{idx}"
+            file_ext = ".pdf" if is_pdf else ".mp4"
+            file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{idx}_{clean_title[:30]}{file_ext}")
+
+            await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(items):03d}]` **Downloading:** `{title}`")
+
+            # Download Logic
+            if is_pdf or not (".m3u8" in url.lower()):
+                success = await download_file_direct(url, file_path)
+            else:
+                async with aiohttp.ClientSession() as s:
+                    stream_url = await resolve_quality_url(s, url, quality)
+
+                cmd = [
+                    "yt-dlp",
+                    "-f", "bestvideo+bestaudio/best",
+                    "--merge-output-format", "mp4",
+                    "--add-header", "Referer:https://www.selectionway.com/",
+                    "--add-header", "Origin:https://www.selectionway.com/",
+                    "--concurrent-fragments", "10",
+                    "-o", file_path,
+                    stream_url,
+                    "--quiet", "--no-warnings"
+                ]
+                proc = await asyncio.create_subprocess_exec(*cmd)
+                await proc.communicate()
+                success = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+
+            if not success or not os.path.exists(file_path):
+                await message.reply_text(f"⚠️ **Failed/Skipped:** `{title}`")
+                continue
+
+            await status_msg.edit_text(f"📤 `[{idx:03d}/{len(items):03d}]` **Uploading:** `{title}`")
+
+            # Formatted Caption Structure
+            caption_text = (
+                f"Index: {idx:03d}\n\n"
+                f"Title: {title}{file_ext}\n\n"
+                f"Topic: {topic}\n\n"
+                f"Batch: {batch}\n\n"
+                f"Extracted By: {credit_name}"
+            )
+
+            try:
+                if is_pdf:
+                    await client.send_document(
+                        chat_id=target_chat_id,
+                        document=file_path,
+                        caption=caption_text
+                    )
+                else:
+                    auto_thumb, vid_w, vid_h, vid_dur = await asyncio.to_thread(get_video_metadata, file_path)
+                    await client.send_video(
+                        chat_id=target_chat_id,
+                        video=file_path,
+                        caption=caption_text,
+                        thumb=auto_thumb,
+                        width=vid_w or 1280,
+                        height=vid_h or 720,
+                        duration=int(vid_dur) or 0,
+                        supports_streaming=True
+                    )
+                    if auto_thumb and os.path.exists(auto_thumb):
+                        os.remove(auto_thumb)
+            except Exception as e:
+                await message.reply_text(f"❌ **Upload Error on `{title}`:** {e}")
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+            await asyncio.sleep(2)
+
+        await status_msg.edit_text("🎉 **All batch files downloaded and uploaded successfully!**")
+        if os.path.exists(txt_path):
+            os.remove(txt_path)
+
+if __name__ == "__main__":
+    app.run()
