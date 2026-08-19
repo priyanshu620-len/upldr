@@ -356,7 +356,7 @@ async def text_step_handler(client: Client, message: Message):
 
             title = item["title"]
             url = item["url"]
-            topic = item.get("topic", "Live Lecture")[cite: 5]
+            topic = item.get("topic", "Live Lecture")
             batch = item.get("batch", default_batch_name)
             is_pdf = item["is_pdf"]
 
