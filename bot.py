@@ -25,14 +25,13 @@ from pyrogram.types import (
 # ==========================================================
 API_ID = int(os.environ.get("API_ID", 30574823))
 API_HASH = os.environ.get("API_HASH", "2815bb996f64421716844acaf2d51493")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8916680408:AAGNA6Y5VK68iibG5H18dr9aZj5r_mA5jEA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8903665090:AAFAstADSgdnWi2_DXNxW4dOKg12ZsE6mrQ")
 
 app = Client(
-    "onex_video_bot",
+    "onex_uploader_session",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
+    bot_token=BOT_TOKEN
 )
 
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -41,13 +40,13 @@ THUMB_DIR = "thumbnails"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR, exist_ok=True)
 
-# State & Duplicate Locks
 STOP_REQUESTS = {}
 SWAY_SESSIONS = {}
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Referer': 'https://transcoded-video.b-cdn.net/'
+    'Referer': 'https://www.selectionway.com/',
+    'Origin': 'https://www.selectionway.com/'
 }
 
 # ==========================================================
@@ -132,7 +131,6 @@ def parse_txt_content(content: str):
         if not line:
             continue
 
-        # Extract Batch Name from Header
         if line.startswith("BATCH:"):
             batch_name = line.replace("BATCH:", "").strip()
             continue
@@ -140,7 +138,6 @@ def parse_txt_content(content: str):
             batch_name = line.split("BATCH :")[1].strip()
             continue
 
-        # Extract Topic headers
         if line.startswith("---") and line.endswith("---"):
             current_topic = line.strip("- \t")
             continue
@@ -157,7 +154,6 @@ def parse_txt_content(content: str):
             continue
         seen_urls.add(url)
 
-        # Parse title
         title_part = line[:url_match.start()].strip().rstrip(':|-').strip()
         title = title_part if title_part else f"Lecture_{len(videos)+1}"
 
@@ -172,38 +168,6 @@ def parse_txt_content(content: str):
 
     return videos, batch_name
 
-async def resolve_quality_url(session: aiohttp.ClientSession, original_url: str, desired_quality: str = "720p") -> str:
-    if not original_url.startswith("http") or desired_quality in ["best", "original"]:
-        return original_url
-
-    for q in ["1080p", "720p", "480p", "360p", "240p"]:
-        if f"/{q}/" in original_url:
-            candidate = original_url.replace(f"/{q}/", f"/{desired_quality}/")
-            try:
-                async with session.head(candidate, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=4)) as r:
-                    if r.status == 200:
-                        return candidate
-            except Exception:
-                pass
-            break
-
-    master_url = re.sub(r"/(1080p|720p|480p|360p)/playlist\.m3u8", "/master.m3u8", original_url)
-    try:
-        async with session.get(master_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status == 200:
-                text = await r.text()
-                lines = text.splitlines()
-                for i, line in enumerate(lines):
-                    if "RESOLUTION=" in line and desired_quality.replace("p", "") in line:
-                        for nxt in lines[i+1:]:
-                            nxt_s = nxt.strip()
-                            if nxt_s and not nxt_s.startswith("#"):
-                                return urllib.parse.urljoin(master_url, nxt_s)
-    except Exception:
-        pass
-
-    return original_url
-
 async def download_file_direct(url: str, file_path: str) -> bool:
     try:
         async with aiohttp.ClientSession() as session:
@@ -216,6 +180,45 @@ async def download_file_direct(url: str, file_path: str) -> bool:
     except Exception:
         pass
     return False
+
+async def download_video_stream(url: str, file_path: str) -> bool:
+    # 1. Try yt-dlp first
+    cmd = [
+        "yt-dlp",
+        "--merge-output-format", "mp4",
+        "--add-header", "Referer:https://www.selectionway.com/",
+        "--add-header", "Origin:https://www.selectionway.com/",
+        "--concurrent-fragments", "10",
+        "-o", file_path,
+        url,
+        "--quiet", "--no-warnings"
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd)
+        await proc.communicate()
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return True
+    except Exception:
+        pass
+
+    # 2. Try ffmpeg fallback
+    try:
+        ffmpeg_cmd = [
+            FFMPEG_EXE, "-y",
+            "-headers", "Referer: https://www.selectionway.com/\r\nOrigin: https://www.selectionway.com/\r\n",
+            "-i", url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            file_path
+        ]
+        res = subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        if res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            return True
+    except Exception:
+        pass
+
+    # 3. Direct file download fallback
+    return await download_file_direct(url, file_path)
 
 # ==========================================================
 # INLINE KEYBOARDS
@@ -231,7 +234,7 @@ def get_quality_keyboard(callback_prefix: str = "qual"):
             InlineKeyboardButton("⚡ 1080p (FHD)", callback_data=f"{callback_prefix}:1080p")
         ],
         [
-            InlineKeyboardButton("🚀 Best / Original", callback_data=f"{callback_prefix}:best")
+            InlineKeyboardButton("🚀 Best Available", callback_data=f"{callback_prefix}:best")
         ]
     ])
 
@@ -284,7 +287,8 @@ async def doc_handler(client: Client, message: Message):
         items, batch_name = parse_txt_content(content)
         if not items:
             await status.edit_text("❌ **No video/PDF links found in this file.**")
-            os.remove(txt_path)
+            if os.path.exists(txt_path):
+                os.remove(txt_path)
             return
 
         session["items"] = items
@@ -324,7 +328,6 @@ async def text_step_handler(client: Client, message: Message):
     if not session:
         return
 
-    # Step 3: Credit text
     if session.get("step") == "WAITING_CREDIT":
         credit_input = message.text.strip()
         session["credit"] = "O ɴ ᴇ 𝐗 🍃" if credit_input.lower() == "none" else credit_input
@@ -335,13 +338,15 @@ async def text_step_handler(client: Client, message: Message):
         )
         return
 
-    # Step 4: Channel ID & Run Pipeline
     if session.get("step") == "WAITING_CHANNEL":
         channel_input = message.text.strip()
-        target_chat_id = message.chat.id if channel_input.lower() == "me" else int(channel_input)
+        try:
+            target_chat_id = message.chat.id if channel_input.lower() == "me" else int(channel_input)
+        except ValueError:
+            await message.reply_text("❌ Invalid Channel ID format. Example: `-1003991146605`")
+            return
 
         items = session["items"]
-        quality = session["quality"]
         credit_name = session["credit"]
         default_batch_name = session.get("batch_name", "Batch")
         txt_path = session["txt_path"]
@@ -366,27 +371,10 @@ async def text_step_handler(client: Client, message: Message):
 
             await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(items):03d}]` **Downloading:** `{title}`")
 
-            # Download Logic
-            if is_pdf or not (".m3u8" in url.lower()):
+            if is_pdf:
                 success = await download_file_direct(url, file_path)
             else:
-                async with aiohttp.ClientSession() as s:
-                    stream_url = await resolve_quality_url(s, url, quality)
-
-                cmd = [
-                    "yt-dlp",
-                    "-f", "bestvideo+bestaudio/best",
-                    "--merge-output-format", "mp4",
-                    "--add-header", "Referer:https://www.selectionway.com/",
-                    "--add-header", "Origin:https://www.selectionway.com/",
-                    "--concurrent-fragments", "10",
-                    "-o", file_path,
-                    stream_url,
-                    "--quiet", "--no-warnings"
-                ]
-                proc = await asyncio.create_subprocess_exec(*cmd)
-                await proc.communicate()
-                success = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+                success = await download_video_stream(url, file_path)
 
             if not success or not os.path.exists(file_path):
                 await message.reply_text(f"⚠️ **Failed/Skipped:** `{title}`")
@@ -394,7 +382,6 @@ async def text_step_handler(client: Client, message: Message):
 
             await status_msg.edit_text(f"📤 `[{idx:03d}/{len(items):03d}]` **Uploading:** `{title}`")
 
-            # Formatted Caption Structure
             caption_text = (
                 f"Index: {idx:03d}\n\n"
                 f"Title: {title}{file_ext}\n\n"
