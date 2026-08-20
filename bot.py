@@ -3,6 +3,7 @@ import gc
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -29,7 +30,8 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+# System ffmpeg fallback if imageio binary has execution permission limits
+FFMPEG_EXE = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = "downloads"
 THUMB_DIR = "thumbnails"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -146,31 +148,22 @@ def get_headers_for_url(url: str, mode: str = "jrf") -> dict:
 # METADATA & PROBING ENGINE (AVOIDS BLACK THUMBNAILS)
 # ==========================================================
 def get_video_metadata(video_path: str):
-    """Calculates dimensions, exact duration, and extracts a vivid frame thumbnail."""
     thumb_path = video_path + "_thumb.jpg"
     width, height, duration = 1280, 720, 0
     try:
-        # Step 1: Probe metadata via FFmpeg/FFprobe
         cmd_probe = [FFMPEG_EXE, "-i", video_path]
         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
-        # Duration parser
         if dur_match := re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr):
             h, m, s = dur_match.groups()
             duration = int(h) * 3600 + int(m) * 60 + float(s)
             
-        # Dimensions parser
         if dim_match := re.search(r",\s*(\d{3,4})x(\d{3,4})", res.stderr):
             width = int(dim_match.group(1))
             height = int(dim_match.group(2))
 
-        # Step 2: Grab high-quality frame (15% in to avoid start screen black fades)
-        if duration > 30:
-            frame_time = min(25, int(duration * 0.15))
-        elif duration > 5:
-            frame_time = 3
-        else:
-            frame_time = 0
+        # Sample at 15% to grab clear lecture frame instead of intro screen
+        frame_time = min(25, max(3, int(duration * 0.15))) if duration > 10 else 1
 
         cmd_thumb = [
             FFMPEG_EXE, "-y",
@@ -183,7 +176,7 @@ def get_video_metadata(video_path: str):
         ]
         subprocess.run(cmd_thumb, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
     except Exception as e:
-        print(f"Metadata error on {video_path}: {e}")
+        print(f"Metadata extraction error: {e}")
 
     final_thumb = thumb_path if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0 else None
     return final_thumb, width, height, int(duration)
@@ -248,7 +241,7 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     return videos, batch_name
 
 # ==========================================================
-# DOWNLOAD ENGINES (YT-DLP + FFmpeg Direct Stream Copy)
+# BULLETPROOF DOWNLOAD PIPELINE
 # ==========================================================
 async def download_file_direct(url: str, file_path: str, user_id: int, status_msg: Message, title: str, mode: str = "jrf") -> bool:
     headers = get_headers_for_url(url, mode)
@@ -291,12 +284,40 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
         print(f"Direct download error: {e}")
     return False
 
+def _ffmpeg_m3u8_download(url: str, file_path: str, headers: dict) -> bool:
+    """Direct FFmpeg HLS stream copy with native AES-128 crypto bypass."""
+    header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+    cmd = [
+        FFMPEG_EXE, "-y",
+        "-headers", header_str,
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+        "-i", url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        file_path
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+        return proc.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024
+    except Exception as e:
+        print(f"FFmpeg Execution Exception: {e}")
+        return False
+
 def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
     headers = get_headers_for_url(url, mode)
-    q_val = quality.replace("p", "")
     
+    # 1. If it's a direct .m3u8 (ClassX, SVR, Stream-OS, FutureKul), execute FFmpeg directly
+    if ".m3u8" in url or "classx.co.in" in url:
+        print(f"🚀 Using direct FFmpeg pipeline for {url}")
+        success = _ffmpeg_m3u8_download(url, file_path, headers)
+        if success:
+            return True
+
+    # 2. Otherwise run yt-dlp with template safety
     base_output_path = os.path.splitext(file_path)[0]
     out_template = f"{base_output_path}.%(ext)s"
+    q_val = quality.replace("p", "")
+    q_filter = f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best" if q_val.isdigit() else "best"
 
     last_update = [0.0]
 
@@ -321,20 +342,18 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
                 )
                 asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
 
-    # 1. Primary Engine: yt-dlp
     ydl_opts = {
         "outtmpl": out_template,
-        "format": "bestvideo+bestaudio/best",
+        "format": q_filter,
         "merge_output_format": "mp4",
         "http_headers": {
             "User-Agent": headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
             "Referer": headers.get("Referer", "https://classx.co.in/"),
             "Origin": headers.get("Origin", "https://classx.co.in"),
         },
-        "concurrent_fragment_downloads": 10,
+        "concurrent_fragment_downloads": 8,
         "retries": 15,
         "fragment_retries": 15,
-        "skip_unavailable_fragments": True,
         "progress_hooks": [ytdlp_hook],
         "quiet": True,
         "no_warnings": True,
@@ -343,34 +362,17 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
+
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024:
             return True
         elif os.path.exists(f"{base_output_path}.mkv"):
             os.rename(f"{base_output_path}.mkv", file_path)
             return True
     except Exception as e:
-        print(f"yt-dlp failed on {url}: {e}, switching to direct FFmpeg...")
+        print(f"yt-dlp fallback attempt on {url}: {e}")
 
-    # 2. Secondary Engine: Direct FFmpeg AES/HLS Copier
-    try:
-        header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-        cmd = [
-            FFMPEG_EXE, "-y",
-            "-headers", header_str,
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-            "-i", url,
-            "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            file_path
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1200)
-        if res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
-            return True
-    except Exception as e:
-        print(f"FFmpeg download error: {e}")
-
-    return False
+    # 3. Final Fallback to direct FFmpeg
+    return _ffmpeg_m3u8_download(url, file_path, headers)
 
 async def download_video_stream(url: str, file_path: str, user_id: int, status_msg: Message, title: str, quality: str = "720", mode: str = "jrf") -> bool:
     loop = asyncio.get_event_loop()
@@ -447,7 +449,6 @@ async def doc_handler(client: Client, message: Message):
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
-    # Dynamic platform resolution
     if "selectionway" in content.lower():
         mode = "sway"
     else:
@@ -517,7 +518,7 @@ async def text_step_handler(client: Client, message: Message):
         )
         return
 
-    # Step 4: Channel ID & Execution Pipeline
+    # Step 4: Channel ID & Execution
     if session.get("step") == "WAITING_CHANNEL":
         channel_input = message.text.strip()
         try:
@@ -558,7 +559,7 @@ async def text_step_handler(client: Client, message: Message):
             file_ext = ".pdf" if is_pdf else ".mp4"
             file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{idx}_{clean_filename[:35]}{file_ext}")
 
-            await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(all_items):03d}]` **Preparing Download:** `{title}`")
+            await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(all_items):03d}]` **Downloading:** `{title}`\n\n_Send /stop to cancel._")
 
             # 1. Download
             if is_pdf:
