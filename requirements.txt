@@ -7,3 +7,4 @@ pyromod
 aiohttp
 yt-dlp
 tgcrypto
+pycryptodome
