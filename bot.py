@@ -1,17 +1,17 @@
-import os
-import sys
-import gc
-import re
-import time
-import math
 import asyncio
+import gc
+import math
+import os
+import re
 import subprocess
 import threading
+import time
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiohttp
 import imageio_ffmpeg
+import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -36,17 +36,11 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(THUMB_DIR, exist_ok=True)
 
 STOP_REQUESTS = {}
-SWAY_SESSIONS = {}
+ACTIVE_SESSIONS = {}
 ACTIVE_SUBPROCESSES = {}
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Referer': 'https://www.selectionway.com/',
-    'Origin': 'https://www.selectionway.com/'
-}
-
 # ==========================================================
-# DUMMY HTTP SERVER
+# DUMMY HTTP SERVER (PORT KEEP-ALIVE)
 # ==========================================================
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -65,9 +59,42 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # ==========================================================
+# DYNAMIC HEADER RESOLVER
+# ==========================================================
+def get_headers_for_url(url: str, mode: str = "sway") -> dict:
+    """Returns domain and platform-specific headers to avoid 403 Forbidden errors."""
+    parsed = urllib.parse.urlparse(url)
+    domain = parsed.netloc.lower()
+
+    if "classx.co.in" in domain or "futurekul" in domain or "stream-os" in domain or mode == "jrf":
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://classx.co.in/",
+            "Origin": "https://classx.co.in"
+        }
+    elif "jrfadda" in domain:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.jrfadda.com/",
+            "Origin": "https://www.jrfadda.com"
+        }
+    elif "akamai" in domain or "appx" in domain:
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://player.akamai.net.in/",
+            "Origin": "https://player.akamai.net.in"
+        }
+
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://www.selectionway.com/",
+        "Origin": "https://www.selectionway.com/"
+    }
+
+# ==========================================================
 # UTILITIES & PROBING
 # ==========================================================
-def format_bytes(size_bytes):
+def format_bytes(size_bytes: int) -> str:
     if size_bytes <= 0:
         return "0 B"
     size_name = ("B", "KB", "MB", "GB", "TB")
@@ -86,43 +113,43 @@ def get_video_metadata(video_path: str):
     try:
         cmd = [
             FFMPEG_EXE, "-y",
-            "-ss", "00:00:02",
+            "-ss", "00:00:03",
             "-i", video_path,
             "-vframes", "1",
             "-vf", "scale=640:-1",
             thumb_path
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-        
+
         cmd_probe = [FFMPEG_EXE, "-i", video_path]
         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
+
         if match := re.search(r"(\d{3,4})x(\d{3,4})", res.stderr):
             width = int(match.group(1))
             height = int(match.group(2))
-            
+
         if dur_match := re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr):
             h, m, s = dur_match.groups()
             duration = int(h) * 3600 + int(m) * 60 + float(s)
     except Exception:
         pass
-        
+
     final_thumb = thumb_path if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0 else None
     return final_thumb, width, height, int(duration)
 
 # ==========================================================
-# PARSER
+# TXT PARSER
 # ==========================================================
-def parse_txt_content(content: str):
+def parse_txt_content(content: str, default_mode: str = "sway"):
     videos = []
     seen_urls = set()
     lines = content.splitlines()
     url_pattern = re.compile(r'https?://[^\s|<>"\']+')
 
-    batch_name = "SelectionWay Batch"
+    batch_name = "JRFAdda Batch" if default_mode == "jrf" else "SelectionWay Batch"
     current_topic = "General Topic"
 
-    for line_idx, raw_line in enumerate(lines, 1):
+    for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
@@ -164,43 +191,15 @@ def parse_txt_content(content: str):
 
     return videos, batch_name
 
-async def resolve_quality_url(session: aiohttp.ClientSession, original_url: str, desired_quality: str = "720") -> str:
-    if not original_url.startswith("http") or desired_quality in ["best", "original"]:
-        return original_url
-
-    q_val = desired_quality.replace("p", "")
-    for q in ["1080", "720", "480", "360", "240"]:
-        if f"/{q}p/" in original_url or f"/{q}/" in original_url:
-            candidate = original_url.replace(f"/{q}p/", f"/{q_val}p/").replace(f"/{q}/", f"/{q_val}/")
-            try:
-                async with session.head(candidate, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=4)) as r:
-                    if r.status == 200:
-                        return candidate
-            except Exception:
-                pass
-            break
-
-    master_url = re.sub(r"/(1080p|720p|480p|360p)/playlist\.m3u8", "/master.m3u8", original_url)
+# ==========================================================
+# DOWNLOAD ENGINES
+# ==========================================================
+async def download_file_direct(url: str, file_path: str, user_id: int, mode: str = "sway") -> bool:
+    headers = get_headers_for_url(url, mode)
     try:
-        async with session.get(master_url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status == 200:
-                text = await r.text()
-                lines = text.splitlines()
-                for i, line in enumerate(lines):
-                    if "RESOLUTION=" in line and q_val in line:
-                        for nxt in lines[i+1:]:
-                            nxt_s = nxt.strip()
-                            if nxt_s and not nxt_s.startswith("#"):
-                                return urllib.parse.urljoin(master_url, nxt_s)
-    except Exception:
-        pass
-
-    return original_url
-
-async def download_file_direct(url: str, file_path: str, user_id: int) -> bool:
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
                 if resp.status == 200:
                     with open(file_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(1024 * 256):
@@ -212,56 +211,72 @@ async def download_file_direct(url: str, file_path: str, user_id: int) -> bool:
         pass
     return False
 
-async def download_video_stream(url: str, file_path: str, user_id: int, quality: str = "720") -> bool:
-    q_filter = "bestvideo+bestaudio/best" if quality in ["best", "1080"] else f"bestvideo[height<={quality.replace('p','')}]/best"
-    
-    cmd = [
-        "yt-dlp",
-        "-f", q_filter,
-        "--merge-output-format", "mp4",
-        "--add-header", "Referer:https://www.selectionway.com/",
-        "--add-header", "Origin:https://www.selectionway.com/",
-        "--concurrent-fragments", "10",
-        "-o", file_path,
-        url,
-        "--quiet", "--no-warnings"
-    ]
+def _ytdlp_download_sync(url: str, file_path: str, quality: str = "720", mode: str = "sway") -> bool:
+    """Integrated yt-dlp downloader execution with custom fragment & retry logic."""
+    out_template = file_path.rsplit(".", 1)[0] + ".%(ext)s"
+    headers = get_headers_for_url(url, mode)
+
+    q_val = quality.replace("p", "")
+    q_filter = "bestvideo+bestaudio/best" if quality in ["best", "1080"] else f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
+
+    ydl_opts = {
+        "outtmpl": out_template,
+        "format": q_filter,
+        "merge_output_format": "mp4",
+        "http_headers": {
+            "User-Agent": headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            "Referer": headers.get("Referer", "https://classx.co.in/"),
+            "Origin": headers.get("Origin", "https://classx.co.in"),
+        },
+        "concurrent_fragment_downloads": 8,
+        "retries": 10,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd)
-        ACTIVE_SUBPROCESSES[user_id] = proc
-        await proc.communicate()
-        ACTIVE_SUBPROCESSES.pop(user_id, None)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return os.path.exists(file_path) and os.path.getsize(file_path) > 0
+    except Exception as e:
+        print(f"yt-dlp download error on {url}: {e}")
+        return False
 
-        if STOP_REQUESTS.get(user_id, False):
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            return False
+async def download_video_stream(url: str, file_path: str, user_id: int, quality: str = "720", mode: str = "sway") -> bool:
+    """Executes the yt-dlp download asynchronously without blocking the event loop."""
+    success = await asyncio.to_thread(_ytdlp_download_sync, url, file_path, quality, mode)
 
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-            return True
-    except Exception:
-        pass
+    if STOP_REQUESTS.get(user_id, False):
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return False
 
-    return await download_file_direct(url, file_path, user_id)
+    if success:
+        return True
+
+    # Fallback to direct HTTP download if yt-dlp cannot parse the stream
+    return await download_file_direct(url, file_path, user_id, mode)
 
 # ==========================================================
-# BOT HANDLERS
+# BOT HANDLERS & ROUTING
 # ==========================================================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     STOP_REQUESTS[message.from_user.id] = False
     await message.reply_text(
-        "👋 **Welcome to SelectionWay Uploader Bot!** 🍃\n\n"
+        "👋 **Welcome to the Multi-Source Extractor & Uploader Bot!** 🍃\n\n"
         "⚡ **Commands:**\n"
         "• `/sway` - Upload batch course from SelectionWay `.txt`\n"
-        "• `/stop` - Immediately cancel ongoing download and upload"
+        "• `/jrf`  - Upload batch course from JRFAdda / ClassX `.txt`\n"
+        "• `/stop` - Immediately cancel ongoing download and upload\n\n"
+        "_Tip: You can also send any `.txt` file directly to auto-start._"
     )
 
 @app.on_message(filters.command("stop") & filters.private)
 async def stop_handler(client: Client, message: Message):
     user_id = message.from_user.id
     STOP_REQUESTS[user_id] = True
-    SWAY_SESSIONS.pop(user_id, None)
+    ACTIVE_SESSIONS.pop(user_id, None)
 
     proc = ACTIVE_SUBPROCESSES.get(user_id)
     if proc:
@@ -271,57 +286,71 @@ async def stop_handler(client: Client, message: Message):
             pass
         ACTIVE_SUBPROCESSES.pop(user_id, None)
 
-    await message.reply_text("🛑 **Process stopped! Any active downloads have been terminated.**")
+    await message.reply_text("🛑 **Process stopped! Any active tasks have been terminated.**")
 
-@app.on_message(filters.command("sway") & filters.private)
-async def sway_command_handler(client: Client, message: Message):
+@app.on_message(filters.command(["sway", "jrf"]) & filters.private)
+async def platform_command_handler(client: Client, message: Message):
     user_id = message.from_user.id
+    cmd = message.command[0].lower()
     STOP_REQUESTS[user_id] = False
-    SWAY_SESSIONS[user_id] = {"step": "WAITING_TXT"}
+
+    platform_name = "JRFAdda / ClassX" if cmd == "jrf" else "SelectionWay"
+    ACTIVE_SESSIONS[user_id] = {
+        "step": "WAITING_TXT",
+        "mode": cmd
+    }
 
     await client.send_message(
         message.chat.id,
-        "📁 **Please send your SelectionWay `.txt` batch file:**"
+        f"📁 **Please send your {platform_name} `.txt` batch file:**"
     )
 
 @app.on_message(filters.document & filters.private)
 async def doc_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    session = SWAY_SESSIONS.get(user_id)
+    session = ACTIVE_SESSIONS.get(user_id, {})
+    mode = session.get("mode", "sway")
 
-    if session and session.get("step") == "WAITING_TXT":
-        if not message.document.file_name.endswith(".txt"):
-            await message.reply_text("❌ Please send a valid `.txt` file.")
-            return
+    if not message.document.file_name.endswith(".txt"):
+        await message.reply_text("❌ Please send a valid `.txt` file.")
+        return
 
-        status = await message.reply_text("📥 **Downloading and parsing .txt file...**")
-        txt_path = await message.download()
+    status = await message.reply_text("📥 **Downloading and parsing .txt file...**")
+    txt_path = await message.download()
 
-        with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
 
-        items, batch_name = parse_txt_content(content)
-        if not items:
-            await status.edit_text("❌ **No video/PDF links found in this file.**")
-            if os.path.exists(txt_path):
-                os.remove(txt_path)
-            return
+    # Auto-detect mode if not explicitly set via command
+    if "classx" in content.lower() or "jrf" in content.lower():
+        mode = "jrf"
 
-        session["items"] = items
-        session["batch_name"] = batch_name
-        session["txt_path"] = txt_path
-        session["step"] = "WAITING_START_INDEX"
+    items, batch_name = parse_txt_content(content, default_mode=mode)
+    if not items:
+        await status.edit_text("❌ **No video or PDF links found in this file.**")
+        if os.path.exists(txt_path):
+            os.remove(txt_path)
+        return
 
-        await status.edit_text(
-            f"✅ **Loaded {len(items)} items from:** `{batch_name}`\n\n"
-            f"🔢 **From where to start?**\n"
-            f"Send start index number (e.g. `1` or `15`):"
-        )
+    ACTIVE_SESSIONS[user_id] = {
+        "items": items,
+        "batch_name": batch_name,
+        "txt_path": txt_path,
+        "mode": mode,
+        "step": "WAITING_START_INDEX"
+    }
+
+    await status.edit_text(
+        f"✅ **Loaded {len(items)} items from:** `{batch_name}`\n"
+        f"🏷 **Engine Mode:** `{mode.upper()}`\n\n"
+        f"🔢 **From where to start?**\n"
+        f"Send start index number (e.g. `1` or `15`):"
+    )
 
 @app.on_message(filters.text & filters.private)
 async def text_step_handler(client: Client, message: Message):
     user_id = message.from_user.id
-    session = SWAY_SESSIONS.get(user_id)
+    session = ACTIVE_SESSIONS.get(user_id)
     if not session:
         return
 
@@ -360,7 +389,7 @@ async def text_step_handler(client: Client, message: Message):
         )
         return
 
-    # Step 4: Channel ID & Run Batch Upload
+    # Step 4: Channel ID & Run Batch Processing
     if session.get("step") == "WAITING_CHANNEL":
         channel_input = message.text.strip()
         try:
@@ -375,15 +404,15 @@ async def text_step_handler(client: Client, message: Message):
         credit_name = session["credit"]
         default_batch_name = session.get("batch_name", "Batch")
         txt_path = session["txt_path"]
+        mode = session.get("mode", "sway")
 
-        # Filter items starting from the chosen index
         items = all_items[start_index - 1:] if start_index <= len(all_items) else []
         if not items:
             await message.reply_text("❌ Start index is higher than the total number of items.")
-            SWAY_SESSIONS.pop(user_id, None)
+            ACTIVE_SESSIONS.pop(user_id, None)
             return
 
-        SWAY_SESSIONS.pop(user_id, None)
+        ACTIVE_SESSIONS.pop(user_id, None)
         status_msg = await message.reply_text(f"🚀 **Starting batch processing from index {start_index} ({len(items)} files)...**")
 
         for idx, item in enumerate(items, start_index):
@@ -393,7 +422,7 @@ async def text_step_handler(client: Client, message: Message):
 
             title = item["title"]
             url = item["url"]
-            topic = item.get("topic", "Live Lecture")
+            topic = item.get("topic", "Lecture")
             batch = item.get("batch", default_batch_name)
             is_pdf = item["is_pdf"]
 
@@ -403,11 +432,11 @@ async def text_step_handler(client: Client, message: Message):
 
             await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(all_items):03d}]` **Downloading:** `{title}`\n\n_Send /stop to cancel._")
 
-            # Download
+            # Download routine
             if is_pdf:
-                success = await download_file_direct(url, file_path, user_id)
+                success = await download_file_direct(url, file_path, user_id, mode)
             else:
-                success = await download_video_stream(url, file_path, user_id, quality)
+                success = await download_video_stream(url, file_path, user_id, quality, mode)
 
             if STOP_REQUESTS.get(user_id, False):
                 if os.path.exists(file_path):
@@ -421,7 +450,6 @@ async def text_step_handler(client: Client, message: Message):
 
             await status_msg.edit_text(f"📤 `[{idx:03d}/{len(all_items):03d}]` **Uploading:** `{title}`")
 
-            # Formatted Caption Structure
             caption_text = (
                 f"Index: {idx:03d}\n\n"
                 f"Title: {title}{file_ext}\n\n"
