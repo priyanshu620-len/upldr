@@ -283,51 +283,23 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
         print(f"Direct download error: {e}")
     return False
 
-def _ffmpeg_m3u8_download(url: str, file_path: str, headers: dict) -> bool:
-    """Direct FFmpeg HLS stream copy with native AES-128 crypto whitelist and auto-reconnect."""
-    header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-    cmd = [
-        FFMPEG_EXE, "-y",
-        "-headers", header_str,
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-        "-allowed_extensions", "ALL",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "10",
-        "-i", url,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        file_path
-    ]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
-        return proc.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024
-    except Exception as e:
-        print(f"FFmpeg Execution Exception: {e}")
-        return False
-
 def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
     headers = get_headers_for_url(url, mode)
-    
-    # 1. Primary Engine: Direct FFmpeg (Reliable for SelectionWay & ClassX M3U8)
-    if ".m3u8" in url or "classx.co.in" in url or "selectionway" in url or "stream-os" in url:
-        print(f"🚀 Running FFmpeg direct copy for: {title}")
-        success = _ffmpeg_m3u8_download(url, file_path, headers)
-        if success:
-            return True
-
-    # 2. Secondary Engine: yt-dlp
     base_output_path = os.path.splitext(file_path)[0]
     out_template = f"{base_output_path}.%(ext)s"
-    q_val = quality.replace("p", "")
-    q_filter = f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best" if q_val.isdigit() else "best"
+    
+    q_val = quality.replace("p", "") if quality else "720"
+    if q_val.isdigit():
+        q_filter = f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
+    else:
+        q_filter = "best"
 
     last_update = [0.0]
 
     def ytdlp_hook(d):
         if d.get("status") == "downloading":
             now = time.time()
-            if now - last_update[0] > 3.5:
+            if now - last_update[0] > 4.0:
                 last_update[0] = now
                 downloaded = d.get("downloaded_bytes", 0)
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -354,10 +326,12 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
             "Referer": headers.get("Referer", "https://classx.co.in/"),
             "Origin": headers.get("Origin", "https://classx.co.in"),
         },
-        "concurrent_fragment_downloads": 8,
-        "retries": 15,
-        "fragment_retries": 15,
+        "concurrent_fragment_downloads": 5,
+        "retries": 20,
+        "fragment_retries": 20,
         "skip_unavailable_fragments": True,
+        "keepvideo": False,
+        "noplaylist": True,
         "progress_hooks": [ytdlp_hook],
         "quiet": True,
         "no_warnings": True,
@@ -367,19 +341,43 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024:
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
             return True
-        elif os.path.exists(f"{base_output_path}.mkv"):
-            os.rename(f"{base_output_path}.mkv", file_path)
-            return True
+        
+        for ext in [".mkv", ".webm", ".ts", ".mp4"]:
+            cand = f"{base_output_path}{ext}"
+            if os.path.exists(cand) and os.path.getsize(cand) > 1024 * 1024:
+                if cand != file_path:
+                    os.rename(cand, file_path)
+                return True
     except Exception as e:
-        print(f"yt-dlp fallback attempt on {url}: {e}")
+        print(f"yt-dlp error on {title}: {e}")
 
-    # 3. Final Fallback to direct FFmpeg
-    return _ffmpeg_m3u8_download(url, file_path, headers)
+    # Fallback to direct FFmpeg stream copy only if yt-dlp fails
+    try:
+        header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+        cmd = [
+            FFMPEG_EXE, "-y",
+            "-headers", header_str,
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+            "-allowed_extensions", "ALL",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "15",
+            "-i", url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            file_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+        return res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024
+    except Exception as e:
+        print(f"FFmpeg fallback failed on {title}: {e}")
+
+    return False
 
 async def download_video_stream(url: str, file_path: str, user_id: int, status_msg: Message, title: str, quality: str = "720", mode: str = "jrf") -> bool:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     success = await asyncio.to_thread(_ytdlp_download_sync, url, file_path, quality, mode, status_msg, title, loop)
 
     if STOP_REQUESTS.get(user_id, False):
