@@ -82,12 +82,11 @@ def format_time(seconds: int) -> str:
     return f"{s}s"
 
 def make_progress_bar(percentage: float) -> str:
-    filled = int(percentage // 10)
+    filled = min(10, max(0, int(percentage // 10)))
     empty = 10 - filled
     return "█" * filled + "░" * empty
 
 async def upload_progress_callback(current, total, status_msg: Message, title: str, start_time: float, last_update: list):
-    """Live progress callback for Pyrogram send_video / send_document."""
     now = time.time()
     if now - last_update[0] < 3.5 and current != total:
         return
@@ -144,12 +143,14 @@ def get_headers_for_url(url: str, mode: str = "jrf") -> dict:
     }
 
 # ==========================================================
-# METADATA & PROBING ENGINE
+# ROBUST METADATA & NON-BLACK THUMBNAIL ENGINE
 # ==========================================================
 def get_video_metadata(video_path: str):
+    """Calculates width, height, exact duration and takes a non-black frame."""
     thumb_path = video_path + "_thumb.jpg"
     width, height, duration = 1280, 720, 0
     try:
+        # Step 1: Extract exact duration & resolution using ffprobe/ffmpeg probe
         cmd_probe = [FFMPEG_EXE, "-i", video_path]
         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
@@ -161,7 +162,14 @@ def get_video_metadata(video_path: str):
             width = int(dim_match.group(1))
             height = int(dim_match.group(2))
 
-        frame_time = min(3, max(0, int(duration) - 1))
+        # Step 2: Avoid black frames by grabbing a frame at 10% to 20% into duration
+        if duration > 30:
+            frame_time = min(30, int(duration * 0.15))
+        elif duration > 5:
+            frame_time = 3
+        else:
+            frame_time = 0
+
         cmd_thumb = [
             FFMPEG_EXE, "-y",
             "-ss", str(frame_time),
@@ -189,7 +197,7 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     batch_name = "JRFAdda Batch" if default_mode == "jrf" else "SelectionWay Batch"
     current_topic = "General Topic"
 
-    for line_idx, raw_line in enumerate(lines, 1):
+    for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
@@ -238,7 +246,7 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     return videos, batch_name
 
 # ==========================================================
-# DOWNLOAD ENGINES WITH LIVE STATS
+# DOWNLOAD ENGINES
 # ==========================================================
 async def download_file_direct(url: str, file_path: str, user_id: int, status_msg: Message, title: str, mode: str = "jrf") -> bool:
     headers = get_headers_for_url(url, mode)
@@ -259,7 +267,6 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
                             f.write(chunk)
                             downloaded += len(chunk)
 
-                            # Update progress stats
                             now = time.time()
                             if now - last_update[0] > 3.5:
                                 last_update[0] = now
@@ -269,7 +276,7 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
                                 bar = make_progress_bar(percent)
                                 try:
                                     await status_msg.edit_text(
-                                        f"📥 **Downloading PDF:** `{title}`\n\n"
+                                        f"📥 **Downloading File:** `{title}`\n\n"
                                         f"**Progress:** [{bar}] `{percent}%`\n"
                                         f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
                                         f"📊 **Size:** `{format_bytes(downloaded)}` / `{format_bytes(total_size)}`"
@@ -277,15 +284,13 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
                                 except Exception:
                                     pass
 
-                    return os.path.exists(file_path) and os.path.getsize(file_path) > 0
+                    return os.path.exists(file_path) and os.path.getsize(file_path) > 1024
     except Exception as e:
         print(f"Direct download error on {url}: {e}")
     return False
 
 def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
-    out_template = file_path.rsplit(".", 1)[0] + ".%(ext)s"
     headers = get_headers_for_url(url, mode)
-
     q_val = quality.replace("p", "")
     q_filter = "bestvideo+bestaudio/best" if quality in ["best", "1080"] else f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
 
@@ -313,7 +318,7 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
                 asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
 
     ydl_opts = {
-        "outtmpl": out_template,
+        "outtmpl": file_path,
         "format": q_filter,
         "merge_output_format": "mp4",
         "http_headers": {
@@ -330,11 +335,30 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return os.path.exists(file_path) and os.path.getsize(file_path) > 0
+            ret = ydl.download([url])
+        
+        # Verify file exists and is larger than 500KB
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024:
+            return True
     except Exception as e:
         print(f"yt-dlp download error on {url}: {e}")
-        return False
+
+    # Fallback to direct ffmpeg copy if yt-dlp fails
+    if ".m3u8" in url:
+        header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+        cmd = [
+            FFMPEG_EXE, "-y",
+            "-headers", header_str,
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-i", url,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            file_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024
+
+    return False
 
 async def download_video_stream(url: str, file_path: str, user_id: int, status_msg: Message, title: str, quality: str = "720", mode: str = "jrf") -> bool:
     loop = asyncio.get_event_loop()
@@ -345,10 +369,7 @@ async def download_video_stream(url: str, file_path: str, user_id: int, status_m
             os.remove(file_path)
         return False
 
-    if success:
-        return True
-
-    return await download_file_direct(url, file_path, user_id, status_msg, title, mode)
+    return success
 
 # ==========================================================
 # BOT HANDLERS & ROUTING
@@ -539,7 +560,7 @@ async def text_step_handler(client: Client, message: Message):
                 break
 
             if not success or not os.path.exists(file_path):
-                await message.reply_text(f"⚠️ **Failed/Skipped:** `{title}`")
+                await message.reply_text(f"⚠️ **Failed/Skipped (Incomplete Download):** `{title}`")
                 continue
 
             caption_text = (
@@ -550,7 +571,7 @@ async def text_step_handler(client: Client, message: Message):
                 f"Extracted By: {credit_name}"
             )
 
-            # 2. Upload with Live Stats
+            # 2. Upload with Live Stats & Native Metadata
             upload_start = time.time()
             last_upload_update = [0.0]
 
