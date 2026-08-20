@@ -30,7 +30,6 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-# System ffmpeg fallback if imageio binary has execution permission limits
 FFMPEG_EXE = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
 DOWNLOAD_DIR = "downloads"
 THUMB_DIR = "thumbnails"
@@ -285,12 +284,16 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
     return False
 
 def _ffmpeg_m3u8_download(url: str, file_path: str, headers: dict) -> bool:
-    """Direct FFmpeg HLS stream copy with native AES-128 crypto bypass."""
+    """Direct FFmpeg HLS stream copy with native AES-128 crypto whitelist and auto-reconnect."""
     header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
     cmd = [
         FFMPEG_EXE, "-y",
         "-headers", header_str,
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+        "-allowed_extensions", "ALL",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "10",
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
@@ -306,14 +309,14 @@ def _ffmpeg_m3u8_download(url: str, file_path: str, headers: dict) -> bool:
 def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
     headers = get_headers_for_url(url, mode)
     
-    # 1. If it's a direct .m3u8 (ClassX, SVR, Stream-OS, FutureKul), execute FFmpeg directly
-    if ".m3u8" in url or "classx.co.in" in url:
-        print(f"🚀 Using direct FFmpeg pipeline for {url}")
+    # 1. Primary Engine: Direct FFmpeg (Reliable for SelectionWay & ClassX M3U8)
+    if ".m3u8" in url or "classx.co.in" in url or "selectionway" in url or "stream-os" in url:
+        print(f"🚀 Running FFmpeg direct copy for: {title}")
         success = _ffmpeg_m3u8_download(url, file_path, headers)
         if success:
             return True
 
-    # 2. Otherwise run yt-dlp with template safety
+    # 2. Secondary Engine: yt-dlp
     base_output_path = os.path.splitext(file_path)[0]
     out_template = f"{base_output_path}.%(ext)s"
     q_val = quality.replace("p", "")
@@ -354,6 +357,7 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
         "concurrent_fragment_downloads": 8,
         "retries": 15,
         "fragment_retries": 15,
+        "skip_unavailable_fragments": True,
         "progress_hooks": [ytdlp_hook],
         "quiet": True,
         "no_warnings": True,
@@ -449,6 +453,7 @@ async def doc_handler(client: Client, message: Message):
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
+    # Dynamic platform resolution
     if "selectionway" in content.lower():
         mode = "sway"
     else:
@@ -555,7 +560,10 @@ async def text_step_handler(client: Client, message: Message):
             batch = item.get("batch", default_batch_name)
             is_pdf = item["is_pdf"]
 
-            clean_filename = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"file_{idx}"
+            # Sanitization to prevent subshell/filesystem breakage
+            safe_title = title.replace("&", "and").replace("+", "and")
+            clean_filename = re.sub(r'[^a-zA-Z0-9_\-\s]', '', safe_title).strip()
+            clean_filename = re.sub(r'\s+', '_', clean_filename) or f"file_{idx}"
             file_ext = ".pdf" if is_pdf else ".mp4"
             file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{idx}_{clean_filename[:35]}{file_ext}")
 
