@@ -59,14 +59,66 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # ==========================================================
-# DYNAMIC HEADER RESOLVER
+# PROGRESS & STATS FORMATTERS
 # ==========================================================
-def get_headers_for_url(url: str, mode: str = "sway") -> dict:
-    """Returns domain and platform-specific headers to avoid 403 Forbidden errors."""
+def format_bytes(size_bytes: int) -> str:
+    if not size_bytes or size_bytes <= 0:
+        return "0 B"
+    size_name = ("B", "KB", "MB", "GB", "TB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    p = math.pow(1024, i)
+    s = round(size_bytes / p, 2)
+    return f"{s} {size_name[i]}"
+
+def format_time(seconds: int) -> str:
+    if seconds <= 0:
+        return "0s"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+def make_progress_bar(percentage: float) -> str:
+    filled = int(percentage // 10)
+    empty = 10 - filled
+    return "█" * filled + "░" * empty
+
+async def upload_progress_callback(current, total, status_msg: Message, title: str, start_time: float, last_update: list):
+    """Live progress callback for Pyrogram send_video / send_document."""
+    now = time.time()
+    if now - last_update[0] < 3.5 and current != total:
+        return
+
+    last_update[0] = now
+    elapsed = max(1, int(now - start_time))
+    speed = current / elapsed
+    percent = round((current / total) * 100, 1) if total > 0 else 0
+    eta = int((total - current) / speed) if speed > 0 else 0
+    bar = make_progress_bar(percent)
+
+    text = (
+        f"📤 **Uploading:** `{title}`\n\n"
+        f"**Progress:** [{bar}] `{percent}%`\n"
+        f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
+        f"📊 **Size:** `{format_bytes(current)}` / `{format_bytes(total)}`\n"
+        f"⏳ **ETA:** `{format_time(eta)}`"
+    )
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        pass
+
+# ==========================================================
+# DYNAMIC HEADERS RESOLVER
+# ==========================================================
+def get_headers_for_url(url: str, mode: str = "jrf") -> dict:
     parsed = urllib.parse.urlparse(url)
     domain = parsed.netloc.lower()
 
-    if "classx.co.in" in domain or "futurekul" in domain or "stream-os" in domain or mode == "jrf":
+    if any(k in domain for k in ["classx", "stream-os", "transcoded", "futurekul"]) or mode == "jrf":
         return {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer": "https://classx.co.in/",
@@ -92,47 +144,36 @@ def get_headers_for_url(url: str, mode: str = "sway") -> dict:
     }
 
 # ==========================================================
-# UTILITIES & PROBING
+# METADATA & PROBING ENGINE
 # ==========================================================
-def format_bytes(size_bytes: int) -> str:
-    if size_bytes <= 0:
-        return "0 B"
-    size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return f"{s} {size_name[i]}"
-
-def get_thumbnail_path(user_id: int):
-    path = os.path.join(THUMB_DIR, f"{user_id}.jpg")
-    return path if os.path.exists(path) and os.path.getsize(path) > 0 else None
-
 def get_video_metadata(video_path: str):
     thumb_path = video_path + "_thumb.jpg"
     width, height, duration = 1280, 720, 0
     try:
-        cmd = [
-            FFMPEG_EXE, "-y",
-            "-ss", "00:00:03",
-            "-i", video_path,
-            "-vframes", "1",
-            "-vf", "scale=640:-1",
-            thumb_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-
         cmd_probe = [FFMPEG_EXE, "-i", video_path]
         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        if match := re.search(r"(\d{3,4})x(\d{3,4})", res.stderr):
-            width = int(match.group(1))
-            height = int(match.group(2))
-
+        
         if dur_match := re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr):
             h, m, s = dur_match.groups()
             duration = int(h) * 3600 + int(m) * 60 + float(s)
-    except Exception:
-        pass
+            
+        if dim_match := re.search(r",\s*(\d{3,4})x(\d{3,4})", res.stderr):
+            width = int(dim_match.group(1))
+            height = int(dim_match.group(2))
+
+        frame_time = min(3, max(0, int(duration) - 1))
+        cmd_thumb = [
+            FFMPEG_EXE, "-y",
+            "-ss", str(frame_time),
+            "-i", video_path,
+            "-vframes", "1",
+            "-vf", "scale=640:-1",
+            "-q:v", "2",
+            thumb_path
+        ]
+        subprocess.run(cmd_thumb, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+    except Exception as e:
+        print(f"Metadata extraction error: {e}")
 
     final_thumb = thumb_path if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0 else None
     return final_thumb, width, height, int(duration)
@@ -140,16 +181,15 @@ def get_video_metadata(video_path: str):
 # ==========================================================
 # TXT PARSER
 # ==========================================================
-def parse_txt_content(content: str, default_mode: str = "sway"):
+def parse_txt_content(content: str, default_mode: str = "jrf"):
     videos = []
     seen_urls = set()
     lines = content.splitlines()
-    url_pattern = re.compile(r'https?://[^\s|<>"\']+')
 
     batch_name = "JRFAdda Batch" if default_mode == "jrf" else "SelectionWay Batch"
     current_topic = "General Topic"
 
-    for raw_line in lines:
+    for line_idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
         if not line:
             continue
@@ -168,56 +208,109 @@ def parse_txt_content(content: str, default_mode: str = "sway"):
             current_topic = line.replace("TOPIC:", "").strip()
             continue
 
-        url_match = url_pattern.search(line)
+        url_match = re.search(r"https?://\S+", line)
         if not url_match:
             continue
 
-        url = url_match.group(0).rstrip('.,;')
+        url = url_match.group(0).rstrip('.,;)"\'')
         if url in seen_urls:
             continue
         seen_urls.add(url)
 
-        title_part = line[:url_match.start()].strip().rstrip(':|-').strip()
-        title = title_part if title_part else f"Lecture_{len(videos)+1}"
+        prefix = line[:url_match.start()].strip()
+        clean_prefix = re.sub(r'[:|\-]+$', '', prefix).strip()
+        clean_title = re.sub(r'^(Free Classes|Paid Classes|All Classes|All Notes|Free Class)\s*', '', clean_prefix, flags=re.I).strip()
+        
+        if not clean_title or clean_title.lower() in ["video", "pdf", "file"]:
+            clean_title = f"Lecture_{len(videos)+1}"
+
+        is_pdf = ".pdf" in url.lower() or "pdf" in clean_title.lower()
 
         videos.append({
             'index': len(videos) + 1,
-            'title': title,
+            'title': clean_title,
             'topic': current_topic,
             'batch': batch_name,
             'url': url,
-            'is_pdf': ".pdf" in url.lower() or "pdf" in title.lower()
+            'is_pdf': is_pdf
         })
 
     return videos, batch_name
 
 # ==========================================================
-# DOWNLOAD ENGINES
+# DOWNLOAD ENGINES WITH LIVE STATS
 # ==========================================================
-async def download_file_direct(url: str, file_path: str, user_id: int, mode: str = "sway") -> bool:
+async def download_file_direct(url: str, file_path: str, user_id: int, status_msg: Message, title: str, mode: str = "jrf") -> bool:
     headers = get_headers_for_url(url, mode)
+    start_time = time.time()
+    last_update = [0.0]
+
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
                 if resp.status == 200:
+                    total_size = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
                     with open(file_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(1024 * 256):
                             if STOP_REQUESTS.get(user_id, False):
                                 return False
                             f.write(chunk)
+                            downloaded += len(chunk)
+
+                            # Update progress stats
+                            now = time.time()
+                            if now - last_update[0] > 3.5:
+                                last_update[0] = now
+                                elapsed = max(1, int(now - start_time))
+                                speed = downloaded / elapsed
+                                percent = round((downloaded / total_size) * 100, 1) if total_size > 0 else 0
+                                bar = make_progress_bar(percent)
+                                try:
+                                    await status_msg.edit_text(
+                                        f"📥 **Downloading PDF:** `{title}`\n\n"
+                                        f"**Progress:** [{bar}] `{percent}%`\n"
+                                        f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
+                                        f"📊 **Size:** `{format_bytes(downloaded)}` / `{format_bytes(total_size)}`"
+                                    )
+                                except Exception:
+                                    pass
+
                     return os.path.exists(file_path) and os.path.getsize(file_path) > 0
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Direct download error on {url}: {e}")
     return False
 
-def _ytdlp_download_sync(url: str, file_path: str, quality: str = "720", mode: str = "sway") -> bool:
-    """Integrated yt-dlp downloader execution with custom fragment & retry logic."""
+def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
     out_template = file_path.rsplit(".", 1)[0] + ".%(ext)s"
     headers = get_headers_for_url(url, mode)
 
     q_val = quality.replace("p", "")
     q_filter = "bestvideo+bestaudio/best" if quality in ["best", "1080"] else f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
+
+    last_update = [0.0]
+
+    def ytdlp_hook(d):
+        if d.get("status") == "downloading":
+            now = time.time()
+            if now - last_update[0] > 3.5:
+                last_update[0] = now
+                downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                speed = d.get("speed") or 0
+                eta = d.get("eta") or 0
+                percent = round((downloaded / total) * 100, 1) if total > 0 else 0
+                bar = make_progress_bar(percent)
+
+                text = (
+                    f"📥 **Downloading Stream:** `{title}`\n\n"
+                    f"**Progress:** [{bar}] `{percent}%`\n"
+                    f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
+                    f"📊 **Size:** `{format_bytes(downloaded)}` / `{format_bytes(total)}`\n"
+                    f"⏳ **ETA:** `{format_time(eta)}`"
+                )
+                asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
 
     ydl_opts = {
         "outtmpl": out_template,
@@ -230,6 +323,7 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str = "720", mode: s
         },
         "concurrent_fragment_downloads": 8,
         "retries": 10,
+        "progress_hooks": [ytdlp_hook],
         "quiet": True,
         "no_warnings": True,
     }
@@ -242,9 +336,9 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str = "720", mode: s
         print(f"yt-dlp download error on {url}: {e}")
         return False
 
-async def download_video_stream(url: str, file_path: str, user_id: int, quality: str = "720", mode: str = "sway") -> bool:
-    """Executes the yt-dlp download asynchronously without blocking the event loop."""
-    success = await asyncio.to_thread(_ytdlp_download_sync, url, file_path, quality, mode)
+async def download_video_stream(url: str, file_path: str, user_id: int, status_msg: Message, title: str, quality: str = "720", mode: str = "jrf") -> bool:
+    loop = asyncio.get_event_loop()
+    success = await asyncio.to_thread(_ytdlp_download_sync, url, file_path, quality, mode, status_msg, title, loop)
 
     if STOP_REQUESTS.get(user_id, False):
         if os.path.exists(file_path):
@@ -254,8 +348,7 @@ async def download_video_stream(url: str, file_path: str, user_id: int, quality:
     if success:
         return True
 
-    # Fallback to direct HTTP download if yt-dlp cannot parse the stream
-    return await download_file_direct(url, file_path, user_id, mode)
+    return await download_file_direct(url, file_path, user_id, status_msg, title, mode)
 
 # ==========================================================
 # BOT HANDLERS & ROUTING
@@ -264,12 +357,12 @@ async def download_video_stream(url: str, file_path: str, user_id: int, quality:
 async def start_handler(client: Client, message: Message):
     STOP_REQUESTS[message.from_user.id] = False
     await message.reply_text(
-        "👋 **Welcome to the Multi-Source Extractor & Uploader Bot!** 🍃\n\n"
+        "👋 **Welcome to the Course Uploader Bot!** 🍃\n\n"
         "⚡ **Commands:**\n"
-        "• `/sway` - Upload batch course from SelectionWay `.txt`\n"
         "• `/jrf`  - Upload batch course from JRFAdda / ClassX `.txt`\n"
+        "• `/sway` - Upload batch course from SelectionWay `.txt`\n"
         "• `/stop` - Immediately cancel ongoing download and upload\n\n"
-        "_Tip: You can also send any `.txt` file directly to auto-start._"
+        "_Tip: Send any `.txt` batch file to start automatically._"
     )
 
 @app.on_message(filters.command("stop") & filters.private)
@@ -309,7 +402,7 @@ async def platform_command_handler(client: Client, message: Message):
 async def doc_handler(client: Client, message: Message):
     user_id = message.from_user.id
     session = ACTIVE_SESSIONS.get(user_id, {})
-    mode = session.get("mode", "sway")
+    mode = session.get("mode", "jrf")
 
     if not message.document.file_name.endswith(".txt"):
         await message.reply_text("❌ Please send a valid `.txt` file.")
@@ -321,8 +414,9 @@ async def doc_handler(client: Client, message: Message):
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
-    # Auto-detect mode if not explicitly set via command
-    if "classx" in content.lower() or "jrf" in content.lower():
+    if "selectionway" in content.lower():
+        mode = "sway"
+    else:
         mode = "jrf"
 
     items, batch_name = parse_txt_content(content, default_mode=mode)
@@ -389,7 +483,7 @@ async def text_step_handler(client: Client, message: Message):
         )
         return
 
-    # Step 4: Channel ID & Run Batch Processing
+    # Step 4: Channel ID & Execution
     if session.get("step") == "WAITING_CHANNEL":
         channel_input = message.text.strip()
         try:
@@ -404,7 +498,7 @@ async def text_step_handler(client: Client, message: Message):
         credit_name = session["credit"]
         default_batch_name = session.get("batch_name", "Batch")
         txt_path = session["txt_path"]
-        mode = session.get("mode", "sway")
+        mode = session.get("mode", "jrf")
 
         items = all_items[start_index - 1:] if start_index <= len(all_items) else []
         if not items:
@@ -426,17 +520,17 @@ async def text_step_handler(client: Client, message: Message):
             batch = item.get("batch", default_batch_name)
             is_pdf = item["is_pdf"]
 
-            clean_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_", "(", ")", ".")).strip() or f"file_{idx}"
+            clean_filename = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"file_{idx}"
             file_ext = ".pdf" if is_pdf else ".mp4"
-            file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{idx}_{clean_title[:30]}{file_ext}")
+            file_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{idx}_{clean_filename[:35]}{file_ext}")
 
-            await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(all_items):03d}]` **Downloading:** `{title}`\n\n_Send /stop to cancel._")
+            await status_msg.edit_text(f"⏳ `[{idx:03d}/{len(all_items):03d}]` **Preparing Download:** `{title}`")
 
-            # Download routine
+            # 1. Download
             if is_pdf:
-                success = await download_file_direct(url, file_path, user_id, mode)
+                success = await download_file_direct(url, file_path, user_id, status_msg, title, mode)
             else:
-                success = await download_video_stream(url, file_path, user_id, quality, mode)
+                success = await download_video_stream(url, file_path, user_id, status_msg, title, quality, mode)
 
             if STOP_REQUESTS.get(user_id, False):
                 if os.path.exists(file_path):
@@ -448,8 +542,6 @@ async def text_step_handler(client: Client, message: Message):
                 await message.reply_text(f"⚠️ **Failed/Skipped:** `{title}`")
                 continue
 
-            await status_msg.edit_text(f"📤 `[{idx:03d}/{len(all_items):03d}]` **Uploading:** `{title}`")
-
             caption_text = (
                 f"Index: {idx:03d}\n\n"
                 f"Title: {title}{file_ext}\n\n"
@@ -458,12 +550,18 @@ async def text_step_handler(client: Client, message: Message):
                 f"Extracted By: {credit_name}"
             )
 
+            # 2. Upload with Live Stats
+            upload_start = time.time()
+            last_upload_update = [0.0]
+
             try:
                 if is_pdf:
                     await client.send_document(
                         chat_id=target_chat_id,
                         document=file_path,
-                        caption=caption_text
+                        caption=caption_text,
+                        progress=upload_progress_callback,
+                        progress_args=(status_msg, title, upload_start, last_upload_update)
                     )
                 else:
                     auto_thumb, vid_w, vid_h, vid_dur = await asyncio.to_thread(get_video_metadata, file_path)
@@ -475,7 +573,9 @@ async def text_step_handler(client: Client, message: Message):
                         width=vid_w or 1280,
                         height=vid_h or 720,
                         duration=int(vid_dur) or 0,
-                        supports_streaming=True
+                        supports_streaming=True,
+                        progress=upload_progress_callback,
+                        progress_args=(status_msg, title, upload_start, last_upload_update)
                     )
                     if auto_thumb and os.path.exists(auto_thumb):
                         os.remove(auto_thumb)
