@@ -9,7 +9,15 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from Crypto.Cipher import AES
+
+# Safe AES import fallback
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError:
+        AES = None
 
 import aiohttp
 import imageio_ffmpeg
@@ -162,6 +170,7 @@ def get_video_metadata(video_path: str):
             width = int(dim_match.group(1))
             height = int(dim_match.group(2))
 
+        # Sample at 15% to grab clear lecture frame instead of intro screen
         frame_time = min(25, max(3, int(duration * 0.15))) if duration > 10 else 1
 
         cmd_thumb = [
@@ -240,12 +249,14 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     return videos, batch_name
 
 # ==========================================================
-# PURE PYTHON ASYNC M3U8 DOWNLOADER (BYPASSES BROKEN BINARIES)
+# ASYNC STREAM ENGINE (FULL SEGMENT PARSER & DECRYPTOR)
 # ==========================================================
 async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, output_path: str, headers: dict, status_msg: Message, title: str, user_id: int) -> bool:
+    temp_ts_path = output_path + ".temp.ts"
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             if resp.status != 200:
+                print(f"❌ Playlist request failed ({resp.status}) for: {url}")
                 return False
             text = await resp.text()
 
@@ -258,10 +269,12 @@ async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, o
             if l and not l.startswith("#") and ".m3u8" in l:
                 sub_playlists.append(urllib.parse.urljoin(url, l))
 
-        # Select the highest quality variant
+        # Select highest quality variant if playlist is a master
         if sub_playlists:
             target_m3u8 = sub_playlists[-1]
             async with session.get(target_m3u8, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status != 200:
+                    return False
                 text = await r.text()
                 lines = text.splitlines()
 
@@ -273,11 +286,9 @@ async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, o
         for l in lines:
             l = l.strip()
             if l.startswith("#EXT-X-KEY:"):
-                # Extract URI
                 m = re.search(r'URI="([^"]+)"', l)
                 if m:
                     key_url = urllib.parse.urljoin(target_m3u8, m.group(1))
-                # Extract IV if specified
                 iv_match = re.search(r'IV=0x([0-9a-fA-F]+)', l)
                 if iv_match:
                     key_iv = bytes.fromhex(iv_match.group(1))
@@ -287,8 +298,8 @@ async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, o
         if not segments:
             return False
 
-        # Fetch decryption key if stream is encrypted
-        if key_url:
+        # Retrieve decryption key if stream is protected
+        if key_url and AES:
             async with session.get(key_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as key_resp:
                 if key_resp.status == 200:
                     key_bytes = await key_resp.read()
@@ -298,7 +309,6 @@ async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, o
         last_update = [0.0]
         start_time = time.time()
 
-        temp_ts_path = output_path + ".temp.ts"
         with open(temp_ts_path, "wb") as outfile:
             for idx, seg_url in enumerate(segments):
                 if STOP_REQUESTS.get(user_id, False):
@@ -307,24 +317,28 @@ async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, o
                         os.remove(temp_ts_path)
                     return False
 
-                async with session.get(seg_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as seg_resp:
-                    if seg_resp.status == 200:
-                        seg_data = await seg_resp.read()
-                        
-                        # Decrypt segment if AES key exists
-                        if key_bytes:
-                            iv = key_iv if key_iv else idx.to_bytes(16, byteorder='big')
-                            cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-                            seg_data = cipher.decrypt(seg_data)
-                            # Remove PKCS7 padding
-                            pad = seg_data[-1]
-                            if pad <= 16:
-                                seg_data = seg_data[:-pad]
+                # Retry up to 3 times per segment
+                for attempt in range(3):
+                    try:
+                        async with session.get(seg_url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as seg_resp:
+                            if seg_resp.status == 200:
+                                seg_data = await seg_resp.read()
 
-                        outfile.write(seg_data)
-                        downloaded_bytes += len(seg_data)
+                                if key_bytes and AES:
+                                    iv = key_iv if key_iv else idx.to_bytes(16, byteorder='big')
+                                    cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                                    seg_data = cipher.decrypt(seg_data)
+                                    pad = seg_data[-1]
+                                    if pad <= 16:
+                                        seg_data = seg_data[:-pad]
 
-                # Progress updater
+                                outfile.write(seg_data)
+                                downloaded_bytes += len(seg_data)
+                                break
+                    except Exception:
+                        await asyncio.sleep(1)
+
+                # Update live stats every 4s
                 now = time.time()
                 if now - last_update[0] > 4.0:
                     last_update[0] = now
@@ -338,24 +352,25 @@ async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, o
                             f"**Progress:** [{bar}] `{percent}%`\n"
                             f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
                             f"📊 **Size:** `{format_bytes(downloaded_bytes)}`\n"
-                            f"🧩 **Fragments:** `{idx + 1}/{total_segs}`"
+                            f"🧩 **Segments:** `{idx + 1}/{total_segs}`"
                         )
                     except Exception:
                         pass
 
-        # Convert/Mux TS to clean MP4
-        if os.path.exists(temp_ts_path) and os.path.getsize(temp_ts_path) > 1024 * 1024:
+        # Mux combined TS segments into an MP4 container
+        if os.path.exists(temp_ts_path) and os.path.getsize(temp_ts_path) > 2 * 1024 * 1024:
             cmd = [
                 FFMPEG_EXE, "-y",
                 "-i", temp_ts_path,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart",
                 output_path
             ]
             res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(temp_ts_path):
                 os.remove(temp_ts_path)
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 1024 * 1024
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 2 * 1024 * 1024
 
     except Exception as e:
         print(f"Async stream engine error on {title}: {e}")
@@ -412,7 +427,7 @@ async def download_video_stream(url: str, file_path: str, user_id: int, status_m
     headers = get_headers_for_url(url, mode)
     connector = aiohttp.TCPConnector(ssl=False)
     
-    # 1. Primary Engine: Pure Python Async M3U8 Downloader (100% reliable for ClassX & SVR)
+    # 1. Primary: Pure Python Async M3U8 Downloader
     if ".m3u8" in url or "classx.co.in" in url or "selectionway" in url or "stream-os" in url:
         print(f"🚀 Using Python Async Native M3U8 Stream Engine: {title}")
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -420,7 +435,7 @@ async def download_video_stream(url: str, file_path: str, user_id: int, status_m
             if success:
                 return True
 
-    # 2. Secondary Engine: Direct System FFmpeg
+    # 2. Secondary: Direct FFmpeg Copier
     header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
     cmd = [
         FFMPEG_EXE, "-y",
@@ -437,13 +452,12 @@ async def download_video_stream(url: str, file_path: str, user_id: int, status_m
     ]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
-        if proc.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
+        if proc.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 2 * 1024 * 1024:
             return True
     except Exception as e:
-        print(f"FFmpeg error: {e}")
+        print(f"FFmpeg error on {title}: {e}")
 
-    # 3. Final Fallback: Direct File Chunk Stream
-    return await download_file_direct(url, file_path, user_id, status_msg, title, mode)
+    return False
 
 # ==========================================================
 # BOT HANDLERS & ROUTING
@@ -509,7 +523,7 @@ async def doc_handler(client: Client, message: Message):
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
-    # Platform Auto-Detection
+    # Dynamic platform resolution
     if "selectionway" in content.lower():
         mode = "sway"
     else:
