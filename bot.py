@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from Crypto.Cipher import AES
 
 import aiohttp
 import imageio_ffmpeg
@@ -161,7 +162,6 @@ def get_video_metadata(video_path: str):
             width = int(dim_match.group(1))
             height = int(dim_match.group(2))
 
-        # Sample at 15% to grab clear lecture frame instead of intro screen
         frame_time = min(25, max(3, int(duration * 0.15))) if duration > 10 else 1
 
         cmd_thumb = [
@@ -240,6 +240,131 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     return videos, batch_name
 
 # ==========================================================
+# PURE PYTHON ASYNC M3U8 DOWNLOADER (BYPASSES BROKEN BINARIES)
+# ==========================================================
+async def async_download_m3u8_stream(session: aiohttp.ClientSession, url: str, output_path: str, headers: dict, status_msg: Message, title: str, user_id: int) -> bool:
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return False
+            text = await resp.text()
+
+        lines = text.splitlines()
+        target_m3u8 = url
+        sub_playlists = []
+
+        for l in lines:
+            l = l.strip()
+            if l and not l.startswith("#") and ".m3u8" in l:
+                sub_playlists.append(urllib.parse.urljoin(url, l))
+
+        # Select the highest quality variant
+        if sub_playlists:
+            target_m3u8 = sub_playlists[-1]
+            async with session.get(target_m3u8, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                text = await r.text()
+                lines = text.splitlines()
+
+        segments = []
+        key_url = None
+        key_iv = None
+        key_bytes = None
+
+        for l in lines:
+            l = l.strip()
+            if l.startswith("#EXT-X-KEY:"):
+                # Extract URI
+                m = re.search(r'URI="([^"]+)"', l)
+                if m:
+                    key_url = urllib.parse.urljoin(target_m3u8, m.group(1))
+                # Extract IV if specified
+                iv_match = re.search(r'IV=0x([0-9a-fA-F]+)', l)
+                if iv_match:
+                    key_iv = bytes.fromhex(iv_match.group(1))
+            elif l and not l.startswith("#"):
+                segments.append(urllib.parse.urljoin(target_m3u8, l))
+
+        if not segments:
+            return False
+
+        # Fetch decryption key if stream is encrypted
+        if key_url:
+            async with session.get(key_url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as key_resp:
+                if key_resp.status == 200:
+                    key_bytes = await key_resp.read()
+
+        total_segs = len(segments)
+        downloaded_bytes = 0
+        last_update = [0.0]
+        start_time = time.time()
+
+        temp_ts_path = output_path + ".temp.ts"
+        with open(temp_ts_path, "wb") as outfile:
+            for idx, seg_url in enumerate(segments):
+                if STOP_REQUESTS.get(user_id, False):
+                    outfile.close()
+                    if os.path.exists(temp_ts_path):
+                        os.remove(temp_ts_path)
+                    return False
+
+                async with session.get(seg_url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as seg_resp:
+                    if seg_resp.status == 200:
+                        seg_data = await seg_resp.read()
+                        
+                        # Decrypt segment if AES key exists
+                        if key_bytes:
+                            iv = key_iv if key_iv else idx.to_bytes(16, byteorder='big')
+                            cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                            seg_data = cipher.decrypt(seg_data)
+                            # Remove PKCS7 padding
+                            pad = seg_data[-1]
+                            if pad <= 16:
+                                seg_data = seg_data[:-pad]
+
+                        outfile.write(seg_data)
+                        downloaded_bytes += len(seg_data)
+
+                # Progress updater
+                now = time.time()
+                if now - last_update[0] > 4.0:
+                    last_update[0] = now
+                    percent = round(((idx + 1) / total_segs) * 100, 1)
+                    elapsed = max(1, int(now - start_time))
+                    speed = downloaded_bytes / elapsed
+                    bar = make_progress_bar(percent)
+                    try:
+                        await status_msg.edit_text(
+                            f"📥 **Downloading Stream:** `{title}`\n\n"
+                            f"**Progress:** [{bar}] `{percent}%`\n"
+                            f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
+                            f"📊 **Size:** `{format_bytes(downloaded_bytes)}`\n"
+                            f"🧩 **Fragments:** `{idx + 1}/{total_segs}`"
+                        )
+                    except Exception:
+                        pass
+
+        # Convert/Mux TS to clean MP4
+        if os.path.exists(temp_ts_path) and os.path.getsize(temp_ts_path) > 1024 * 1024:
+            cmd = [
+                FFMPEG_EXE, "-y",
+                "-i", temp_ts_path,
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                output_path
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(temp_ts_path):
+                os.remove(temp_ts_path)
+            return os.path.exists(output_path) and os.path.getsize(output_path) > 1024 * 1024
+
+    except Exception as e:
+        print(f"Async stream engine error on {title}: {e}")
+        if os.path.exists(temp_ts_path):
+            os.remove(temp_ts_path)
+
+    return False
+
+# ==========================================================
 # BULLETPROOF DOWNLOAD PIPELINE
 # ==========================================================
 async def download_file_direct(url: str, file_path: str, user_id: int, status_msg: Message, title: str, mode: str = "jrf") -> bool:
@@ -283,109 +408,42 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
         print(f"Direct download error: {e}")
     return False
 
-def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
-    headers = get_headers_for_url(url, mode)
-    base_output_path = os.path.splitext(file_path)[0]
-    out_template = f"{base_output_path}.%(ext)s"
-    
-    q_val = quality.replace("p", "") if quality else "720"
-    if q_val.isdigit():
-        q_filter = f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
-    else:
-        q_filter = "best"
-
-    last_update = [0.0]
-
-    def ytdlp_hook(d):
-        if d.get("status") == "downloading":
-            now = time.time()
-            if now - last_update[0] > 4.0:
-                last_update[0] = now
-                downloaded = d.get("downloaded_bytes", 0)
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                speed = d.get("speed") or 0
-                eta = d.get("eta") or 0
-                percent = round((downloaded / total) * 100, 1) if total > 0 else 0
-                bar = make_progress_bar(percent)
-
-                text = (
-                    f"📥 **Downloading Stream:** `{title}`\n\n"
-                    f"**Progress:** [{bar}] `{percent}%`\n"
-                    f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
-                    f"📊 **Size:** `{format_bytes(downloaded)}` / `{format_bytes(total)}`\n"
-                    f"⏳ **ETA:** `{format_time(eta)}`"
-                )
-                asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
-
-    ydl_opts = {
-        "outtmpl": out_template,
-        "format": q_filter,
-        "merge_output_format": "mp4",
-        "http_headers": {
-            "User-Agent": headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
-            "Referer": headers.get("Referer", "https://classx.co.in/"),
-            "Origin": headers.get("Origin", "https://classx.co.in"),
-        },
-        "concurrent_fragment_downloads": 5,
-        "retries": 20,
-        "fragment_retries": 20,
-        "skip_unavailable_fragments": True,
-        "keepvideo": False,
-        "noplaylist": True,
-        "progress_hooks": [ytdlp_hook],
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
-            return True
-        
-        for ext in [".mkv", ".webm", ".ts", ".mp4"]:
-            cand = f"{base_output_path}{ext}"
-            if os.path.exists(cand) and os.path.getsize(cand) > 1024 * 1024:
-                if cand != file_path:
-                    os.rename(cand, file_path)
-                return True
-    except Exception as e:
-        print(f"yt-dlp error on {title}: {e}")
-
-    # Fallback to direct FFmpeg stream copy only if yt-dlp fails
-    try:
-        header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-        cmd = [
-            FFMPEG_EXE, "-y",
-            "-headers", header_str,
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
-            "-allowed_extensions", "ALL",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "15",
-            "-i", url,
-            "-c", "copy",
-            "-bsf:a", "aac_adtstoasc",
-            file_path
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
-        return res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024
-    except Exception as e:
-        print(f"FFmpeg fallback failed on {title}: {e}")
-
-    return False
-
 async def download_video_stream(url: str, file_path: str, user_id: int, status_msg: Message, title: str, quality: str = "720", mode: str = "jrf") -> bool:
-    loop = asyncio.get_running_loop()
-    success = await asyncio.to_thread(_ytdlp_download_sync, url, file_path, quality, mode, status_msg, title, loop)
+    headers = get_headers_for_url(url, mode)
+    connector = aiohttp.TCPConnector(ssl=False)
+    
+    # 1. Primary Engine: Pure Python Async M3U8 Downloader (100% reliable for ClassX & SVR)
+    if ".m3u8" in url or "classx.co.in" in url or "selectionway" in url or "stream-os" in url:
+        print(f"🚀 Using Python Async Native M3U8 Stream Engine: {title}")
+        async with aiohttp.ClientSession(connector=connector) as session:
+            success = await async_download_m3u8_stream(session, url, file_path, headers, status_msg, title, user_id)
+            if success:
+                return True
 
-    if STOP_REQUESTS.get(user_id, False):
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        return False
+    # 2. Secondary Engine: Direct System FFmpeg
+    header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
+    cmd = [
+        FFMPEG_EXE, "-y",
+        "-headers", header_str,
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+        "-allowed_extensions", "ALL",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "15",
+        "-i", url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        file_path
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+        if proc.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
+            return True
+    except Exception as e:
+        print(f"FFmpeg error: {e}")
 
-    return success
+    # 3. Final Fallback: Direct File Chunk Stream
+    return await download_file_direct(url, file_path, user_id, status_msg, title, mode)
 
 # ==========================================================
 # BOT HANDLERS & ROUTING
@@ -451,7 +509,7 @@ async def doc_handler(client: Client, message: Message):
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
-    # Dynamic platform resolution
+    # Platform Auto-Detection
     if "selectionway" in content.lower():
         mode = "sway"
     else:
