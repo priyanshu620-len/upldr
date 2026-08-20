@@ -117,7 +117,7 @@ def get_headers_for_url(url: str, mode: str = "jrf") -> dict:
     parsed = urllib.parse.urlparse(url)
     domain = parsed.netloc.lower()
 
-    if any(k in domain for k in ["classx", "stream-os", "transcoded", "futurekul"]) or mode == "jrf":
+    if any(k in domain for k in ["classx", "stream-os", "transcoded", "futurekul", "classplus"]) or mode == "jrf":
         return {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer": "https://classx.co.in/",
@@ -143,28 +143,30 @@ def get_headers_for_url(url: str, mode: str = "jrf") -> dict:
     }
 
 # ==========================================================
-# ROBUST METADATA & NON-BLACK THUMBNAIL ENGINE
+# METADATA & PROBING ENGINE (AVOIDS BLACK THUMBNAILS)
 # ==========================================================
 def get_video_metadata(video_path: str):
-    """Calculates width, height, exact duration and takes a non-black frame."""
+    """Calculates dimensions, exact duration, and extracts a vivid frame thumbnail."""
     thumb_path = video_path + "_thumb.jpg"
     width, height, duration = 1280, 720, 0
     try:
-        # Step 1: Extract exact duration & resolution using ffprobe/ffmpeg probe
+        # Step 1: Probe metadata via FFmpeg/FFprobe
         cmd_probe = [FFMPEG_EXE, "-i", video_path]
         res = subprocess.run(cmd_probe, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
+        # Duration parser
         if dur_match := re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr):
             h, m, s = dur_match.groups()
             duration = int(h) * 3600 + int(m) * 60 + float(s)
             
+        # Dimensions parser
         if dim_match := re.search(r",\s*(\d{3,4})x(\d{3,4})", res.stderr):
             width = int(dim_match.group(1))
             height = int(dim_match.group(2))
 
-        # Step 2: Avoid black frames by grabbing a frame at 10% to 20% into duration
+        # Step 2: Grab high-quality frame (15% in to avoid start screen black fades)
         if duration > 30:
-            frame_time = min(30, int(duration * 0.15))
+            frame_time = min(25, int(duration * 0.15))
         elif duration > 5:
             frame_time = 3
         else:
@@ -181,7 +183,7 @@ def get_video_metadata(video_path: str):
         ]
         subprocess.run(cmd_thumb, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
     except Exception as e:
-        print(f"Metadata extraction error: {e}")
+        print(f"Metadata error on {video_path}: {e}")
 
     final_thumb = thumb_path if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0 else None
     return final_thumb, width, height, int(duration)
@@ -197,7 +199,7 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     batch_name = "JRFAdda Batch" if default_mode == "jrf" else "SelectionWay Batch"
     current_topic = "General Topic"
 
-    for raw_line in lines:
+    for line_idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
         if not line:
             continue
@@ -246,7 +248,7 @@ def parse_txt_content(content: str, default_mode: str = "jrf"):
     return videos, batch_name
 
 # ==========================================================
-# DOWNLOAD ENGINES
+# DOWNLOAD ENGINES (YT-DLP + FFmpeg Direct Stream Copy)
 # ==========================================================
 async def download_file_direct(url: str, file_path: str, user_id: int, status_msg: Message, title: str, mode: str = "jrf") -> bool:
     headers = get_headers_for_url(url, mode)
@@ -276,7 +278,7 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
                                 bar = make_progress_bar(percent)
                                 try:
                                     await status_msg.edit_text(
-                                        f"📥 **Downloading File:** `{title}`\n\n"
+                                        f"📥 **Downloading PDF:** `{title}`\n\n"
                                         f"**Progress:** [{bar}] `{percent}%`\n"
                                         f"⚡ **Speed:** `{format_bytes(int(speed))}/s`\n"
                                         f"📊 **Size:** `{format_bytes(downloaded)}` / `{format_bytes(total_size)}`"
@@ -286,13 +288,15 @@ async def download_file_direct(url: str, file_path: str, user_id: int, status_ms
 
                     return os.path.exists(file_path) and os.path.getsize(file_path) > 1024
     except Exception as e:
-        print(f"Direct download error on {url}: {e}")
+        print(f"Direct download error: {e}")
     return False
 
 def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, status_msg: Message, title: str, loop: asyncio.AbstractEventLoop) -> bool:
     headers = get_headers_for_url(url, mode)
     q_val = quality.replace("p", "")
-    q_filter = "bestvideo+bestaudio/best" if quality in ["best", "1080"] else f"bestvideo[height<={q_val}]+bestaudio/best[height<={q_val}]/best"
+    
+    base_output_path = os.path.splitext(file_path)[0]
+    out_template = f"{base_output_path}.%(ext)s"
 
     last_update = [0.0]
 
@@ -317,17 +321,20 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
                 )
                 asyncio.run_coroutine_threadsafe(status_msg.edit_text(text), loop)
 
+    # 1. Primary Engine: yt-dlp
     ydl_opts = {
-        "outtmpl": file_path,
-        "format": q_filter,
+        "outtmpl": out_template,
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "http_headers": {
             "User-Agent": headers.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
             "Referer": headers.get("Referer", "https://classx.co.in/"),
             "Origin": headers.get("Origin", "https://classx.co.in"),
         },
-        "concurrent_fragment_downloads": 8,
-        "retries": 10,
+        "concurrent_fragment_downloads": 10,
+        "retries": 15,
+        "fragment_retries": 15,
+        "skip_unavailable_fragments": True,
         "progress_hooks": [ytdlp_hook],
         "quiet": True,
         "no_warnings": True,
@@ -335,16 +342,18 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ret = ydl.download([url])
+            ydl.download([url])
         
-        # Verify file exists and is larger than 500KB
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024:
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
+            return True
+        elif os.path.exists(f"{base_output_path}.mkv"):
+            os.rename(f"{base_output_path}.mkv", file_path)
             return True
     except Exception as e:
-        print(f"yt-dlp download error on {url}: {e}")
+        print(f"yt-dlp failed on {url}: {e}, switching to direct FFmpeg...")
 
-    # Fallback to direct ffmpeg copy if yt-dlp fails
-    if ".m3u8" in url:
+    # 2. Secondary Engine: Direct FFmpeg AES/HLS Copier
+    try:
         header_str = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
         cmd = [
             FFMPEG_EXE, "-y",
@@ -355,8 +364,11 @@ def _ytdlp_download_sync(url: str, file_path: str, quality: str, mode: str, stat
             "-bsf:a", "aac_adtstoasc",
             file_path
         ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 500 * 1024
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1200)
+        if res.returncode == 0 and os.path.exists(file_path) and os.path.getsize(file_path) > 1024 * 1024:
+            return True
+    except Exception as e:
+        print(f"FFmpeg download error: {e}")
 
     return False
 
@@ -435,6 +447,7 @@ async def doc_handler(client: Client, message: Message):
     with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
+    # Dynamic platform resolution
     if "selectionway" in content.lower():
         mode = "sway"
     else:
@@ -504,7 +517,7 @@ async def text_step_handler(client: Client, message: Message):
         )
         return
 
-    # Step 4: Channel ID & Execution
+    # Step 4: Channel ID & Execution Pipeline
     if session.get("step") == "WAITING_CHANNEL":
         channel_input = message.text.strip()
         try:
@@ -560,7 +573,7 @@ async def text_step_handler(client: Client, message: Message):
                 break
 
             if not success or not os.path.exists(file_path):
-                await message.reply_text(f"⚠️ **Failed/Skipped (Incomplete Download):** `{title}`")
+                await message.reply_text(f"⚠️ **Failed/Skipped:** `{title}`")
                 continue
 
             caption_text = (
